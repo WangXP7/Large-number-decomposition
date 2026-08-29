@@ -404,6 +404,11 @@ def scan_magnitude(k, N, mode, ctl, detail=False):
         while primes_found < PRIMES_PER_GROUP and n <= N:
             if ctl is not None:
                 ctl.check()
+            if ctl is not None and ctl.prog is not None:
+                try:
+                    ctl.prog.put(("curnum", ctl.seq, pretty_num(n, 40)))
+                except Exception:
+                    pass
             t1 = time.perf_counter()
             kind, a, b = classify_number(n, mode, ctl)
             dt = time.perf_counter() - t1
@@ -543,6 +548,11 @@ def render_group_lines(k, N, rows, primes_found, scanned, stop_kind, detail=Fals
     if n_comp:
         lines.append((f"  —— 另扫描合数 {n_comp} 个，均已按所选模式分解完毕"
                       f"（勾选「列出合数明细」可逐个查看）\n", "muted"))
+    if rows:
+        slowest = sorted(rows, key=lambda r: r[4], reverse=True)[:3]
+        ent = "、".join(f"{pretty_num(num, 40)}（用时 {fmt_time(dt)}）"
+                        for num, _k, _a, _b, dt in slowest)
+        lines.append((f"  —— 本组耗时最长的 {len(slowest)} 个数：{ent}\n", "muted"))
     if stop_kind is not None:
         note = {"timeout": f"【本组限时已到：检查了 {scanned} 个数，只找到 {primes_found}/{PRIMES_PER_GROUP} 个质数——可调大「每组限时」或选「不限时」重跑】",
                 "stopped": f"【已停止：检查了 {scanned} 个数，找到 {primes_found}/{PRIMES_PER_GROUP} 个质数】",
@@ -657,6 +667,7 @@ class PoolRunner:
         self._finished = False
         self._outstanding = {}        # seq -> (k, pretty, t_submit)
         self._prog_detail = {}        # seq -> (elapsed, 最新进度文本)
+        self._curnum = {}             # seq -> (正在算的数, 该数开始时刻)
         self._pending_item = None
         self._seq = 0
         self._items = None
@@ -741,6 +752,7 @@ class PoolRunner:
         _, seq, kind, a, b, dt = msg
         info = self._outstanding.pop(seq, None)
         self._prog_detail.pop(seq, None)
+        self._curnum.pop(seq, None)
         if info is None:
             return
         if kind == "group":
@@ -794,20 +806,24 @@ class PoolRunner:
         self.out_q.put(("outstanding", len(self._outstanding)))
 
     def _post_progress_line(self, now):
-        """把所有进行中组的概要合并成一行（界面原地刷新，不刷屏）。"""
+        """进行中的组汇总：一个数量级一行，含正在算的数及其耗时。"""
         if not self._outstanding:
-            line = "[正在计算] 等待计算结果…"
+            lines = ["[正在计算] 等待计算结果…"]
         else:
-            items = []
-            for seq, (k, _pretty, t) in sorted(self._outstanding.items())[:8]:
+            lines = []
+            for seq, (k, _pretty, t) in sorted(self._outstanding.items()):
+                if len(lines) >= 12:
+                    lines.append(f"……其余 {len(self._outstanding) - len(lines) + 1} 组进行中")
+                    break
                 detail = self._prog_detail.get(seq)
                 phase = self._phase_of(detail[1] if detail else None)
-                items.append(f"10^{k}（已 {now - t:.0f} 秒，{phase}）")
-            more = len(self._outstanding) - len(items)
-            line = (f"[正在计算] 共 {len(self._outstanding)} 组："
-                    + "｜".join(items)
-                    + (f" …等 {more} 组" if more > 0 else ""))
-        self.out_q.put(("progress_line", line))
+                cur = self._curnum.get(seq)
+                if cur:
+                    lines.append(f"数量级 10^{k}（本组已 {now - t:.0f} 秒）"
+                                 f"正在算 {cur[0]}（该数已 {now - cur[1]:.0f} 秒，{phase}）")
+                else:
+                    lines.append(f"数量级 10^{k}（本组已 {now - t:.0f} 秒，{phase}）")
+        self.out_q.put(("progress_lines", lines))
 
     def _feeder_loop(self):
         try:
@@ -824,6 +840,9 @@ class PoolRunner:
                     if msg[0] == "prog":
                         _, seq, elapsed, text = msg
                         self._prog_detail[seq] = (elapsed, text)
+                    elif msg[0] == "curnum":
+                        _, seq, ntext = msg
+                        self._curnum[seq] = (ntext, time.perf_counter())
                     elif msg[0] == "milestone":
                         _, seq, text = msg
                         info = self._outstanding.get(seq)
@@ -1263,8 +1282,8 @@ class App:
                 elif kind == "milestone":
                     self._append(msg[1] + "\n", "muted")
                     self.txt.see("end")
-                elif kind == "progress_line":
-                    self.var_live.set(msg[1])
+                elif kind == "progress_lines":
+                    self.var_live.set("\n".join(msg[1]))
                 elif kind == "status":
                     self.var_status.set(msg[1])
                 elif kind == "outstanding":
@@ -1393,19 +1412,23 @@ def selftest():
     primes2 = [num for num, kind, *_ in rows if kind == "prime"]
     assert primes2 == [101, 103, 107] and stop is None, (primes2, scanned)
     print("数量级扫描 OK：10^0→[2,3,5]  10^1→[11,13,17]  10^2→[101,103,107]")
-    # 渲染：紧凑模式只列质数+合数摘要；明细模式逐个列出
+    # 渲染：紧凑模式只列质数+合数摘要+耗时最长 3 个数；明细模式逐个列出
     header, lines, tail = render_group_lines(2, 10 ** 3, rows, 3, scanned, None, False)
     tags = [t for _l, t in lines]
-    assert tags.count("prime") == 3 and tags.count("muted") == 1 and len(lines) == 4, (tags, lines)
-    assert "另扫描合数 5 个" in lines[-1][0], lines[-1]
+    assert tags.count("prime") == 3 and tags.count("muted") == 2 and len(lines) == 5, (tags, len(lines))
+    assert "另扫描合数 5 个" in lines[3][0], lines[3]
+    top3_line = lines[4][0]
+    assert "耗时最长的 3 个数" in top3_line and top3_line.count("用时") == 3, top3_line
     header_d, lines_d, tail_d = render_group_lines(2, 10 ** 3, rows, 3, scanned, None, True)
-    assert len(lines_d) == scanned and sum(1 for _l, t in lines_d if t == "prime") == 3
+    assert len(lines_d) == scanned + 1 and sum(1 for _l, t in lines_d if t == "prime") == 3
+    assert "耗时最长的 3 个数" in lines_d[-1][0]
     print("紧凑/明细渲染 OK")
-    # 渲染对齐：同一组内 = 与 用时 的显示列一致（中文按 2 倍宽度）
+    # 渲染对齐：数行的 = 与 用时 显示列一致（中文按 2 倍宽度；汇总行不参与对齐）
     header, lines, tail = render_group_lines(1, 10 ** 2, rows, 3, scanned, None, True)
-    eq_cols = {disp_width(l.split(" = ")[0]) for l, _t in lines}
-    use_cols = {disp_width(l.split("用时")[0]) for l, _t in lines}
-    assert len(eq_cols) == 1 and len(use_cols) == 1, (eq_cols, use_cols)
+    row_lines = [l for l, _t in lines if " = " in l]
+    eq_cols = {disp_width(l.split(" = ")[0]) for l in row_lines}
+    use_cols = {disp_width(l.split("用时")[0]) for l in row_lines}
+    assert len(row_lines) == scanned and len(eq_cols) == 1 and len(use_cols) == 1, (eq_cols, use_cols)
     print("组内对齐 OK")
     # 限时路径：60 位半素数 1 秒内应超时
     random.seed(7)
