@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller 构建产物（exe 已直接放在仓库根目录）
+build/
+dist/
+*.log
+
+# 编辑器
+.vscode/
+.idea/
