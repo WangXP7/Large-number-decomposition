@@ -5,16 +5,19 @@
 功能
 ====
 1. 输入一个很大的正整数 N（支持 10^100、2^64、1e50 写法或直接粘贴）。
-2. 对每个数量级 10^k（k = 0,1,2,… 直到 N 的数量级），取该数量级的前三个数
-   10^k、10^k+1、10^k+2（最后一组不超过 N），按所选模式处理：
+2. 对每个数量级 10^k（k = 0,1,2,… 直到 N 的数量级）：从 10^k 起逐个向上扫描，
+   **找出该数量级的前 3 个质数**（可能要测试很多个数）；途中经过的合数也按所选模式
+   分解后列出（最后一组不超过 N）。
+   两种分解模式（可单选）：
    · 完整质因数分解：分解成所有质因数之积；
    · 仅分解为两个数相乘：找到一个非平凡因子 d，给出 n = d × (n/d)，即可证明 n 是合数。
-3. 大数一律缩写显示：10^n、10^n+d 或 a.bcd×10^n，避免一长串 0。
-4. 本身是质数的数用红色标出；限时内未能完全分解 / 被跳过的用橙色标出。
-5. 多进程并行：按 CPU 核数开计算进程（可调），结果仍按数量级顺序显示。
-6. 限时可选“不限时”；运行中可 暂停/继续、跳过当前、停止；
-   单个数计算超过 2 秒后，会持续打印中间过程（试除→素性检测→p-1→rho 各阶段）。
-7. 界面下方实时显示电脑基本信息（CPU 型号/线程数、整机 CPU 占用、内存）和
+3. 大数一律缩写显示：10^n、10^n+d 或 a.bcd×10^n，不再是一长串 0。
+4. 质数用红色标出；限时内未能完成 / 被跳过的内容用橙色标出。
+5. 多进程并行：按 CPU 核数开计算进程（可调），每个数量级一个任务，结果按顺序显示；
+   组内 = 号对齐、「用时」列对齐。
+6. 限时（作用于每个数量级）可选「不限时」；运行中可 暂停/继续、跳过当前、停止。
+7. 慢任务中间过程：持续打印当前进度（已扫描多少个数、找到几个质数、rho/p-1/MR 各阶段）。
+8. 界面下方实时显示电脑基本信息（CPU 型号/线程数、整机 CPU 占用、内存）和
    本程序占用（进程数、CPU 折合核数、内存）。
 
 用法
@@ -45,6 +48,7 @@ PM1_MAX_BITS = 2_500          # 超过该位数不做 Pollard p-1
 RHO_MAX_BITS = 8_000          # 超过该位数不做 Pollard rho
 PM1_B1 = 50_000               # Pollard p-1 第一阶段界限
 MAX_DIGITS = 200_000          # 允许输入的最大十进制位数
+PRIMES_PER_GROUP = 3          # 每个数量级要找出的质数个数
 
 try:
     sys.set_int_max_str_digits(2_000_000)   # Python 3.11+ 默认 int/str 限制 4300 位
@@ -53,7 +57,7 @@ except AttributeError:
 
 
 class FactorTimeout(Exception):
-    """单个数在限时内未能完成。args 含部分结果"""
+    """限时内未能完成。args 含部分结果"""
 
 
 class StopRequested(Exception):
@@ -114,7 +118,7 @@ class Ctl:
             raise FactorTimeout()
 
     def note(self, text):
-        """中间过程：单个任务运行 2 秒后才开始上报，且最多每秒一条。"""
+        """中间过程：任务运行 2 秒后才开始上报，且最多每秒一条。"""
         if self.prog is None:
             return
         now = time.perf_counter()
@@ -261,9 +265,11 @@ def factorize(n, ctl):
             if m == 1:
                 cur = None
                 continue
-            for p in get_primes():
+            for pi, p in enumerate(get_primes()):
                 if p * p > m:
                     break
+                if pi % 4096 == 0 and ctl is not None:
+                    ctl.check()
                 while m % p == 0:
                     factors[p] = factors.get(p, 0) + 1
                     m //= p
@@ -307,9 +313,11 @@ def factorize_two(n, ctl):
     """
     if n % 2 == 0:
         return (2, n // 2)
-    for p in get_primes():
+    for pi, p in enumerate(get_primes()):
         if p * p > n:
             break
+        if pi % 4096 == 0 and ctl is not None:
+            ctl.check()
         if n % p == 0:
             return (p, n // p)
     pr = is_prime(n, ctl)
@@ -333,13 +341,85 @@ def factorize_two(n, ctl):
         raise
 
 
+# ------------------------------------------------------------------ 数量级扫描（找前 3 个质数）
+
+def classify_number(n, mode, ctl):
+    """判定/分解单个数。返回 (kind, a, b)：
+    unit / prime / full(合数,因子dict,None) / two(d,余因子) /
+    timeout(部分因子,剩余) / twofail(d或None,None) / fullhard / stopped / skipped
+    """
+    if n == 1:
+        return ("unit", None, None)
+    try:
+        if mode == "two":
+            r = factorize_two(n, ctl)
+            if r is None:
+                return ("prime", None, None)
+            return ("two", r[0], r[1])
+        factors, hard = factorize(n, ctl)
+        if hard:
+            return ("fullhard", factors, hard)
+        if len(factors) == 1 and factors.get(n) == 1:
+            return ("prime", None, None)
+        return ("full", factors, None)
+    except FactorTimeout as e:
+        if mode == "two":
+            return ("twofail", e.args[0] if e.args else None, None)
+        f, r = e.args if len(e.args) == 2 else ({}, [n])
+        return ("timeout", f, r)
+    except StopRequested as e:
+        if mode == "two":
+            return ("stopped", None, None)
+        f, r = e.args if len(e.args) == 2 else ({}, [n])
+        return ("stopped", f, r)
+    except SkipRequested:
+        return ("skipped", None, None)
+
+
+def scan_magnitude(k, N, mode, ctl):
+    """一个数量级的扫描任务：从 10^k 起逐个向上，直到找出前 3 个质数。
+
+    返回 (rows, primes_found, scanned, stop_kind)
+    rows: [(num, kind, a, b, dt)]；stop_kind: None / timeout / stopped / skipped
+    限时（若有）作用于整个数量级。
+    """
+    rows = []
+    primes_found = 0
+    scanned = 0
+    stop_kind = None
+    n = 10 ** k
+    if ctl is not None:
+        ctl.note(f"数量级 10^{k}：开始逐个扫描，目标前 {PRIMES_PER_GROUP} 个质数")
+    try:
+        while primes_found < PRIMES_PER_GROUP and n <= N:
+            if ctl is not None:
+                ctl.check()
+            t1 = time.perf_counter()
+            kind, a, b = classify_number(n, mode, ctl)
+            dt = time.perf_counter() - t1
+            scanned += 1
+            if kind == "prime":
+                primes_found += 1
+            rows.append((n, kind, a, b, dt))
+            n += 1
+            if ctl is not None:
+                ctl.note(f"已扫描 {scanned} 个数，找到 {primes_found}/{PRIMES_PER_GROUP} 个质数")
+    except FactorTimeout:
+        stop_kind = "timeout"
+    except StopRequested:
+        stop_kind = "stopped"
+    except SkipRequested:
+        stop_kind = "skipped"
+    return rows, primes_found, scanned, stop_kind
+
+
 # ------------------------------------------------------------------ 显示辅助
 
 def pretty_num(x, limit=18):
     """大数缩写：10^n / 10^n+d / a.bcd×10^n；短数直接显示。
 
     ≥10 位的数若为 10 的幂或 10^n 加小偏移，一律缩写（无论多长）；
-    其余 ≤18 位照原样显示，更长的用 7 位有效数字的科学计数法。
+    其余 ≤18 位照原样显示，更长的用 7 位有效数字的科学计数法（尾零去除）。
     """
     s = str(x)
     if len(s) >= 10:
@@ -350,8 +430,18 @@ def pretty_num(x, limit=18):
         if 0 <= d < 10 ** 7:
             return f"10^{k}+{d}"
         if len(s) > limit:
-            return f"{s[0]}.{s[1:7]}×10^{k}"
+            mant = (s[0] + "." + s[1:7]).rstrip("0").rstrip(".")
+            return f"{mant}×10^{k}"
     return s
+
+
+def disp_width(s):
+    """终端显示宽度：中文等全角字符按 2 计。"""
+    return sum(2 if ord(ch) > 0x2E7F else 1 for ch in s)
+
+
+def pad_to(s, width):
+    return s + " " * max(0, width - disp_width(s))
 
 
 def fmt_factors(factors):
@@ -370,70 +460,73 @@ def fmt_time(t):
     return f"{t * 1e6:.1f} µs"
 
 
-def render_result(num, kind, a, b, dt, pad):
-    """把单个数的计算结果渲染为输出行。(line, tag)"""
-    t = f"用时 {fmt_time(dt)}"
-    nd = pretty_num(num, 60)
+HARD_KINDS = ("timeout", "stopped", "skipped", "fullhard", "twofail")
+
+
+def fact_text(kind, a, b):
+    """单个数的分解式文本（不含用时）。"""
     if kind == "unit":
-        return f"  {nd} = 1（既不是质数也不是合数）    {t}\n", None
+        return "1（单位，非质数非合数）"
     if kind == "prime":
-        return f"  {nd} = 质数（本身不可再分解）    {t}\n", "prime"
+        return "质数"
     if kind == "two":
-        return f"  {nd} = {pretty_num(a)} × {pretty_num(b)}（两数相乘，已证明是合数）    {t}\n", None
+        return f"{pretty_num(a)} × {pretty_num(b)}"
     if kind == "twofail":
-        return f"  {nd} = ？【限时内未找到非平凡因子：既未能证明是合数，也未确认为质数】    {t}\n", "hard"
-    if kind in ("timeout", "stopped", "skipped", "fullhard"):
+        return "？【限时内未找到非平凡因子，未能证明是合数】"
+    if kind in HARD_KINDS:
         note = {"timeout": "【限时内未能完全分解】",
-                "stopped": "【已停止，未完全分解】",
-                "skipped": "【已跳过（用户中止）】",
-                "fullhard": "【位数过大，仅试除到 10^5，未能完全分解】"}[kind]
+                "stopped": "【已停止】",
+                "skipped": "【已跳过】",
+                "fullhard": "【位数过大，仅试除到 10^5，未能完全分解】",
+                "twofail": "【限时内未找到非平凡因子】"}[kind]
         base = fmt_factors(a) if a else ""
         if b:
             rp = " × ".join(f"{pretty_num(r, 44)}（{len(str(r))}位）" for r in b)
             body = f"{base} × {rp}{note}" if base else rp + note
         else:
             body = (base + note) if base else note
-        return f"  {nd} = {body}    {t}\n", "hard"
-    if kind == "error":
-        return f"  {nd} = 【计算出错】{a}    {t}\n", "hard"
-    return f"  {nd} = {fmt_factors(a)}    {t}\n", None
+        return body
+    return fmt_factors(a)
 
 
-# ------------------------------------------------------------------ 任务生成
-
-def count_numbers(N):
-    """每个数量级取前三个数（不超过 N），总共多少个数。"""
-    c = 0
-    p = 1
-    while p <= N:
-        c += 3 if p + 2 <= N else (2 if p + 1 <= N else 1)
-        p *= 10
-    return c
+def group_header(k, N):
+    lo = 10 ** k
+    upper = f"10^{k + 1}-1" if k >= 1 else "9"
+    if N < lo * 10:                       # 最后一个不完整的数量级
+        upper = pretty_num(N, 30)
+    return ("\n" + "─" * 12 + f" 数量级 10^{k}（{pretty_num(lo, 30)} ~ {upper}）"
+            + "─" * 12 + "\n")
 
 
-def build_tasks(N):
-    """（自检用）与 iter_display_items 等价的任务列表。"""
-    tasks = []
-    p = 1
-    while p <= N:
-        tasks.append([x for x in (p, p + 1, p + 2) if x <= N])
-        p *= 10
-    return tasks
+def render_group_lines(k, N, rows, primes_found, scanned, stop_kind):
+    """把一个数量级的扫描结果渲染为对齐的行。
+
+    返回 (header, [(line, tag)...], tail)；
+    组内所有 = 号对齐、「用时」列对齐（中文按 2 倍宽度计算）。
+    """
+    header = group_header(k, N)
+    maxnum = max((disp_width(pretty_num(num, 60)) for num, *_ in rows), default=0)
+    facts = [fact_text(kind, a, b) for _num, kind, a, b, _dt in rows]
+    maxf = max((disp_width(f) for f in facts), default=0)
+    lines = []
+    for (num, kind, a, b, dt), fs in zip(rows, facts):
+        nd = pad_to(pretty_num(num, 60), maxnum)
+        fsp = pad_to(fs, maxf)
+        tag = "prime" if kind == "prime" else ("hard" if kind in HARD_KINDS else None)
+        lines.append((f"  {nd} = {fsp}    用时 {fmt_time(dt)}\n", tag))
+    if stop_kind is not None:
+        note = {"timeout": f"【本组限时到：扫过 {scanned} 个数，找到 {primes_found}/{PRIMES_PER_GROUP} 个质数】",
+                "stopped": f"【已停止：扫过 {scanned} 个数，找到 {primes_found}/{PRIMES_PER_GROUP} 个质数】",
+                "skipped": f"【已跳过本组：扫过 {scanned} 个数，找到 {primes_found}/{PRIMES_PER_GROUP} 个质数】"}[stop_kind]
+        tail = (f"  {note}\n", "hard")
+    elif primes_found >= PRIMES_PER_GROUP:
+        tail = (f"  —— 本组共扫描 {scanned} 个数，找到前 {PRIMES_PER_GROUP} 个质数\n", "muted")
+    else:
+        tail = (f"  —— 已扫到 N，本组共 {scanned} 个数，质数 {primes_found} 个\n", "muted")
+    return header, lines, tail
 
 
-def iter_display_items(N):
-    """按顺序产出显示项：("header", k, nums, pad) 和 ("num", x, pad)。"""
-    p = 1
-    k = 0
-    while p <= N:
-        nums = [x for x in (p, p + 1, p + 2) if x <= N]
-        pad = min(max(len(pretty_num(x, 60)) for x in nums), 60)
-        yield ("header", k, nums, pad)
-        for x in nums:
-            yield ("num", x, pad)
-        p *= 10
-        k += 1
-
+# ------------------------------------------------------------------ 输入
 
 def parse_input(text):
     s = str(text).strip()
@@ -469,40 +562,18 @@ def parse_input(text):
 
 # ------------------------------------------------------------------ 多进程计算
 
-def _do_task(seq, num, limit, mode, stop_event, skip_event, result_q):
-    """在计算进程里处理一个数，返回结构化结果（也可中途发进度消息）。"""
+def _do_group_task(seq, k, N, limit, mode, stop_event, skip_event, result_q):
+    """在计算进程里处理一个数量级：扫描并渲染好整组行。"""
     deadline = None if not limit else time.perf_counter() + limit
     ctl = Ctl(stop_event, skip_event, deadline, prog=result_q, seq=seq)
     t1 = time.perf_counter()
     try:
-        if num == 1:
-            return ("result", seq, "unit", None, None, 0.0)
-        if mode == "two":
-            r = factorize_two(num, ctl)
-            dt = time.perf_counter() - t1
-            if r is None:
-                return ("result", seq, "prime", None, None, dt)
-            return ("result", seq, "two", r[0], r[1], dt)
-        factors, hard = factorize(num, ctl)
-        dt = time.perf_counter() - t1
-        return ("result", seq, "fullhard" if hard else "full", factors, hard, dt)
-    except FactorTimeout as e:
-        dt = time.perf_counter() - t1
-        if mode == "two":
-            d = e.args[0] if e.args else None
-            return ("result", seq, "twofail", d, None, dt)
-        f, r = e.args if len(e.args) == 2 else ({}, [num])
-        return ("result", seq, "timeout", f, r, dt)
-    except SkipRequested:
-        return ("result", seq, "skipped", None, None, time.perf_counter() - t1)
-    except StopRequested as e:
-        dt = time.perf_counter() - t1
-        if mode == "two":
-            return ("result", seq, "stopped", None, None, dt)
-        f, r = e.args if len(e.args) == 2 else ({}, [num])
-        return ("result", seq, "stopped", f, r, dt)
+        rows, pf, scanned, stop_kind = scan_magnitude(k, N, mode, ctl)
+        header, lines, tail = render_group_lines(k, N, rows, pf, scanned, stop_kind)
+        payload = (header, lines, tail, pf, scanned)
+        return ("result", seq, "group", payload, None, time.perf_counter() - t1)
     except Exception as e:
-        return ("result", seq, "error", f"{type(e).__name__}: {e}", None,
+        return ("result", seq, "gerror", f"{type(e).__name__}: {e}", None,
                 time.perf_counter() - t1)
 
 
@@ -515,11 +586,11 @@ def _pool_worker(task_q, result_q, stop_event, skip_event):
             return
         if task is None:
             return
-        seq, num, limit, mode = task
+        seq, k, N, limit, mode = task
         try:
-            res = _do_task(seq, num, limit, mode, stop_event, skip_event, result_q)
+            res = _do_group_task(seq, k, N, limit, mode, stop_event, skip_event, result_q)
         except Exception as e:
-            res = ("result", seq, "error", repr(e), None, 0.0)
+            res = ("result", seq, "gerror", repr(e), None, 0.0)
         try:
             result_q.put(res)
         except Exception:
@@ -527,14 +598,13 @@ def _pool_worker(task_q, result_q, stop_event, skip_event):
 
 
 class PoolRunner:
-    """多进程分解流水线：任务按数量级顺序生成，结果按原顺序回传给界面。
+    """多进程流水线：每个数量级一个任务，结果按数量级顺序回传给界面。
 
     out_q 消息：
-      ("slot", seq, text, tag)            按顺序显示的行（含数量级标题）
-      ("progline", text)                  慢任务中间过程
+      ("slot", seq, content)     content = [(text, tag), ...] 按顺序显示的一组行
+      ("progline", text)         慢任务中间过程
       ("status", text) / ("outstanding", n)
-      ("summary", text, status_text)      结束汇总
-      ("error", text)
+      ("summary", text, status_text) / ("error", text)
     """
 
     def __init__(self, N, limit, mode, workers, out_q):
@@ -554,13 +624,13 @@ class PoolRunner:
         self._skip_wait = False
         self._exhausted = False
         self._finished = False
-        self._outstanding = {}        # seq -> (num, pretty, pad, t_submit)
+        self._outstanding = {}        # seq -> (k, pretty, t_submit)
         self._pending_item = None
         self._seq = 0
         self._items = None
-        self._stats = {"n": 0, "prime": 0, "partial": 0, "fact": 0.0}
+        self._stats = {"n": 0, "prime": 0, "partial": 0, "fact": 0.0, "scanned": 0}
         self._done = 0
-        self._total = count_numbers(N)
+        self._total = len(str(N))     # 每个数量级一组
         self._t0 = time.perf_counter()
 
     def start(self):
@@ -577,8 +647,14 @@ class PoolRunner:
             p.start()
             self._procs.append(p)
             self.pids.append(p.pid)
-        self._items = iter_display_items(self.N)
+        self._items = self._iter_groups()
         threading.Thread(target=self._feeder_loop, daemon=True).start()
+
+    def _iter_groups(self):
+        k = 0
+        while 10 ** k <= self.N:
+            yield ("group", k)
+            k += 1
 
     def pause(self):
         self._paused = True
@@ -613,15 +689,6 @@ class PoolRunner:
 
     # ---------------- 内部 ----------------
 
-    def _header_text(self, item):
-        _, k, nums, _pad = item
-        lo = nums[0]
-        upper = f"10^{k + 1}-1" if k >= 1 else "9"
-        if self.N < lo * 10:                      # 最后一个不完整的数量级
-            upper = pretty_num(self.N, 30)
-        return ("\n" + "─" * 12 + f" 数量级 10^{k}（{pretty_num(lo, 30)} ~ {upper}）"
-                + "─" * 12 + "\n")
-
     def _refill(self):
         while not self._stop_flag and not self._paused \
                 and len(self._outstanding) < self.workers and not self._exhausted:
@@ -631,16 +698,10 @@ class PoolRunner:
                 except StopIteration:
                     self._exhausted = True
                     return
-            item = self._pending_item
-            if item[0] == "header":
-                self._pending_item = None
-                self.out_q.put(("slot", self._seq, self._header_text(item), "group"))
-                self._seq += 1
-                continue
-            _, num, pad = item
+            _, k = self._pending_item
             seq = self._seq
-            self._task_q.put((seq, num, self.limit, self.mode))
-            self._outstanding[seq] = (num, pretty_num(num, 46), pad, time.perf_counter())
+            self._task_q.put((seq, k, self.N, self.limit, self.mode))
+            self._outstanding[seq] = (k, f"数量级 10^{k}", time.perf_counter())
             self._seq += 1
             self._pending_item = None
 
@@ -649,16 +710,23 @@ class PoolRunner:
         info = self._outstanding.pop(seq, None)
         if info is None:
             return
-        num, _pretty, pad, _t = info
-        line, tag = render_result(num, kind, a, b, dt, pad)
-        self._done += 1
-        self._stats["n"] += 1
-        self._stats["fact"] += dt
-        if tag == "prime":
-            self._stats["prime"] += 1
-        if kind in ("timeout", "stopped", "skipped", "fullhard", "twofail", "error"):
+        if kind == "group":
+            header, lines, tail, pf, scanned = a
+            content = [(header, "group")] + [tuple(x) for x in lines]
+            if tail:
+                content.append(tuple(tail))
+            self.out_q.put(("slot", seq, content))
+            self._done += 1
+            self._stats["n"] += 1
+            self._stats["prime"] += pf
+            self._stats["fact"] += dt
+            self._stats["scanned"] += scanned
+            if tail and tail[1] == "hard":
+                self._stats["partial"] += 1
+        else:  # gerror
+            self.out_q.put(("slot", seq, [(f"  数量级计算出错：{a}\n", "hard")]))
+            self._done += 1
             self._stats["partial"] += 1
-        self.out_q.put(("slot", seq, line, tag))
         if self._skip_wait and not self._outstanding:
             self._skip_event.clear()
             self._skip_wait = False
@@ -666,9 +734,9 @@ class PoolRunner:
     def _post_status(self):
         now = time.perf_counter()
         infl = "｜".join(f"{pretty}（{now - t:.1f}s）"
-                         for _seq, (_num, pretty, _p, t) in
+                         for _seq, (_k, pretty, t) in
                          sorted(self._outstanding.items())[:6])
-        txt = (f"已完成 {self._done}/{self._total}"
+        txt = (f"已完成 {self._done}/{self._total} 组 · 已扫描 {self._stats['scanned']} 个数"
                + (f" · 进行中：{infl}" if infl else "")
                + (" · 已暂停" if self._paused else "")
                + (" · 正在停止…" if self._stop_flag else "")
@@ -733,15 +801,17 @@ class PoolRunner:
         wall = time.perf_counter() - self._t0
         s = self._stats
         mode_txt = "完整质因数分解" if self.mode == "full" else "仅分解为两数相乘（证合数）"
-        limit_txt = "不限时" if not self.limit else f"每数限时 {self.limit}s"
+        limit_txt = "不限时" if not self.limit else f"每组限时 {self.limit}s"
         head = "已停止" if self._stop_flag else "全部完成"
         summary = (
             "\n" + "═" * 78 + "\n"
             + f"{head}｜模式：{mode_txt}｜{self.workers} 进程｜{limit_txt}\n"
-            + f"共处理 {s['n']} 个数 · 质数 {s['prime']} 个 · 未完全分解/跳过 {s['partial']} 个\n"
+            + f"共处理 {s['n']}/{self._total} 个数量级 · 扫描 {s['scanned']} 个数 · "
+            + f"质数 {s['prime']} 个 · 未完成/跳过 {s['partial']} 组\n"
             + f"分解总计用时：{fmt_time(s['fact'])}（从开始到结束共 {fmt_time(wall)}）\n")
-        status = (f"{head} · 共 {s['n']} 个数 · 质数 {s['prime']} 个"
-                  + (f" · 未完全分解/跳过 {s['partial']} 个" if s["partial"] else "")
+        status = (f"{head} · 共 {s['n']}/{self._total} 组 · 扫描 {s['scanned']} 个数 · "
+                  + f"质数 {s['prime']} 个"
+                  + (f" · 未完成/跳过 {s['partial']} 组" if s["partial"] else "")
                   + f" · 分解总计用时 {fmt_time(s['fact'])}")
         self.out_q.put(("summary", summary, status))
 
@@ -872,7 +942,7 @@ TAGS = {
     "muted": {"foreground": "#8a8a8a", "font": ("Consolas", 9)},
 }
 
-LIMIT_CHOICES = ["不限时", "1", "2", "5", "10", "30", "60", "300", "600", "1800", "3600"]
+LIMIT_CHOICES = ["不限时", "5", "10", "30", "60", "300", "600", "1800", "3600"]
 
 
 class App:
@@ -889,7 +959,7 @@ class App:
 
         ncpu = os.cpu_count() or 4
 
-        root.title("大数分解可视化 · 每个数量级分解前三个数（多进程并行版）")
+        root.title("大数分解可视化 · 每个数量级找出前 3 个质数（多进程并行版）")
         root.geometry("1180x820")
 
         # 底部两栏先按 side=bottom 锚定，保证任何窗口高度下都可见
@@ -904,7 +974,7 @@ class App:
         sysbar.pack(side="bottom", fill="x")
         self.var_sys = tk.StringVar(value="读取电脑信息…")
         ttk.Label(sysbar, textvariable=self.var_sys, foreground="#555",
-                  wraplength=1050, justify="left").pack(fill="x")
+                  wraplength=1150, justify="left").pack(fill="x")
 
         top = ttk.Frame(root, padding=(10, 10, 10, 2))
         top.pack(fill="x")
@@ -914,7 +984,7 @@ class App:
         ent.pack(side="left", padx=(2, 8))
         ent.focus_set()
         ent.bind("<Return>", lambda _e: self.start())
-        ttk.Label(top, text="限时:").pack(side="left")
+        ttk.Label(top, text="每组限时:").pack(side="left")
         self.var_limit = tk.StringVar(value="10")
         ttk.Combobox(top, textvariable=self.var_limit, values=LIMIT_CHOICES,
                      width=6).pack(side="left", padx=(2, 8))
@@ -942,15 +1012,24 @@ class App:
         ttk.Radiobutton(mid, text="仅分解为两个数相乘（找到一个因子、证明是合数即可）",
                         value="two", variable=self.var_mode).pack(side="left", padx=(10, 0))
 
-        hint = ("说明：对每个数量级 10^k（k = 0,1,2,…），取该数量级的前三个数 10^k、10^k+1、10^k+2"
-                "（最后一组不超过 N）按所选模式分解。质数红色标出；限时未完成/跳过的橙色标出；"
-                "大数以 10^n、10^n+d 或 a.bc×10^n 缩写显示。慢任务会打印中间过程。")
-        ttk.Label(root, text=hint, wraplength=1050, justify="left", foreground="#555",
+        hint = ("说明：对每个数量级 10^k（k = 0,1,2,…），从 10^k 起逐个向上扫描，找出该数量级的"
+                "前 3 个质数（可能要测试很多个数）；途中经过的合数也按所选模式分解后列出（不超过 N）。"
+                "质数红色标出；限时未完成/跳过的橙色标出；大数以 10^n、10^n+d 或 a.bc×10^n 缩写显示。")
+        ttk.Label(root, text=hint, wraplength=1150, justify="left", foreground="#555",
                   padding=(12, 2)).pack(fill="x")
 
-        self.txt = scrolledtext.ScrolledText(root, font=("Consolas", 10), wrap="char",
-                                             state="disabled", bg="#fcfcf8")
-        self.txt.pack(fill="both", expand=True, padx=10, pady=6)
+        txtframe = ttk.Frame(root)
+        txtframe.pack(fill="both", expand=True, padx=10, pady=6)
+        hsb = ttk.Scrollbar(txtframe, orient="horizontal")
+        vsb = ttk.Scrollbar(txtframe, orient="vertical")
+        self.txt = tk.Text(txtframe, font=("Consolas", 10), wrap="none",
+                           state="disabled", bg="#fcfcf8",
+                           xscrollcommand=hsb.set, yscrollcommand=vsb.set)
+        hsb.configure(command=self.txt.xview)
+        vsb.configure(command=self.txt.yview)
+        hsb.pack(side="bottom", fill="x")
+        vsb.pack(side="right", fill="y")
+        self.txt.pack(fill="both", expand=True)
         for tag, kw in TAGS.items():
             self.txt.tag_configure(tag, **kw)
 
@@ -967,7 +1046,7 @@ class App:
         try:
             return min(max(int(float(s)), 1), 86400)
         except Exception:
-            raise ValueError("「每数限时」请选/填正整数秒，或选「不限时」")
+            raise ValueError("「每组限时」请选/填正整数秒，或选「不限时」")
 
     def start(self):
         if self.running:
@@ -994,8 +1073,8 @@ class App:
         groups = len(str(N))
         if groups > 400 and not messagebox.askyesno(
                 "确认",
-                f"N 有 {groups} 位，将处理 {groups} 个数量级（共 {count_numbers(N)} 个数），\n"
-                f"可能耗时非常久。确定继续吗？"):
+                f"N 有 {groups} 位，将处理 {groups} 个数量级；数量级越大，找到 3 个质数\n"
+                f"需要扫描的数越多（平均约 2.3×k 个），可能耗时非常久。确定继续吗？"):
             return
         self.running = True
         self._slots = {}
@@ -1007,8 +1086,8 @@ class App:
         mode_txt = "完整质因数分解" if mode == "full" else "仅分解为两数相乘（证合数）"
         self._append(
             f"输入 N = {pretty_num(N, 80)}（{len(str(N))} 位）｜模式：{mode_txt}"
-            f"｜{workers} 进程｜每数限时 {'不限时' if limit is None else str(limit) + ' 秒'}\n"
-            "规则：每个数量级 10^k 取前三个数 10^k、10^k+1、10^k+2；\n"
+            f"｜{workers} 进程｜每组限时 {'不限时' if limit is None else str(limit) + ' 秒'}\n"
+            f"规则：每个数量级 10^k 从 10^k 起逐个扫描，找出前 {PRIMES_PER_GROUP} 个质数（途中合数也列出）；\n"
             "      红色 = 质数；橙色 = 限时未完成/已跳过；缩写：10^n、10^n+d、a.bc×10^n。\n"
             + "─" * 78 + "\n", None)
         self.btn_start["state"] = "disabled"
@@ -1019,7 +1098,6 @@ class App:
         self.pbar.start(50)
         self.var_status.set(f"正在启动 {workers} 个计算进程…")
         self.runner = PoolRunner(N, limit, mode, workers, self.q)
-        self.runner_pids = self.runner.pids
         self.runner.start()
         self.runner_pids = self.runner.pids
 
@@ -1070,15 +1148,18 @@ class App:
             self.txt.insert("end", text, tag)
         else:
             self.txt.insert("end", text)
-        self.txt.see("end")
         self.txt.configure(state="disabled")
 
-    def _feed_slot(self, seq, text, tag):
-        self._slots[seq] = (text, tag)
+    def _feed_slot(self, seq, content):
+        self._slots[seq] = content
         while self._next_seq in self._slots:
-            t, g = self._slots.pop(self._next_seq)
-            self._append(t, g)
+            c = self._slots.pop(self._next_seq)
+            if isinstance(c, tuple):
+                c = [c]
+            for text, tag in c:
+                self._append(text, tag)
             self._next_seq += 1
+        self.txt.see("end")
 
     def _poll(self):
         try:
@@ -1086,7 +1167,7 @@ class App:
                 msg = self.q.get_nowait()
                 kind = msg[0]
                 if kind == "slot":
-                    self._feed_slot(msg[1], msg[2], msg[3])
+                    self._feed_slot(msg[1], msg[2])
                 elif kind == "progline":
                     self._append(msg[1] + "\n", "muted")
                 elif kind == "status":
@@ -1169,11 +1250,6 @@ def _next_prime(x):
 
 def selftest():
     ev = threading.Event()
-    assert build_tasks(1) == [[1]]
-    assert build_tasks(10) == [[1, 2, 3], [10]]
-    assert build_tasks(12) == [[1, 2, 3], [10, 11, 12]]
-    assert build_tasks(10001) == [[1, 2, 3], [10, 11, 12], [100, 101, 102],
-                                  [1000, 1001, 1002], [10000, 10001]]
     # 缩写显示
     assert pretty_num(10 ** 21) == "10^21"
     assert pretty_num(10 ** 21 + 1) == "10^21+1"
@@ -1186,6 +1262,7 @@ def selftest():
     assert pretty_num(999999999999999989) == "999999999999999989"
     assert "×10^" in pretty_num(3 ** 60)
     assert pretty_num(10 ** 40 + 5) == "10^40+5"
+    assert pretty_num(5 * 10 ** 103) == "5×10^103"          # 科学计数法去尾零
     # 素性
     assert is_prime(1) is False
     assert is_prime(2) is True
@@ -1208,9 +1285,23 @@ def selftest():
     d, cof = factorize_two(91, ctl)
     assert d * cof == 91 and {d, cof} == {7, 13}
     assert factorize_two(2 ** 61 - 1, ctl) is None
-    d, cof = factorize_two(10 ** 21 + 1, ctl)
-    assert d * cof == 10 ** 21 + 1
-    print(f"10^21+1 = {d} × {cof}（证合数模式）")
+    # 数量级扫描：找前 3 个质数
+    rows, pf, scanned, stop = scan_magnitude(0, 10, "full", None)
+    primes0 = [num for num, kind, *_ in rows if kind == "prime"]
+    assert primes0 == [2, 3, 5] and stop is None, (primes0, pf, scanned, stop)
+    rows, pf, scanned, stop = scan_magnitude(1, 10 ** 2, "full", None)
+    primes1 = [num for num, kind, *_ in rows if kind == "prime"]
+    assert primes1 == [11, 13, 17] and scanned == 8 and stop is None, (primes1, scanned)
+    rows, pf, scanned, stop = scan_magnitude(2, 10 ** 3, "two", None)
+    primes2 = [num for num, kind, *_ in rows if kind == "prime"]
+    assert primes2 == [101, 103, 107] and stop is None, (primes2, scanned)
+    print("数量级扫描 OK：10^0→[2,3,5]  10^1→[11,13,17]  10^2→[101,103,107]")
+    # 渲染对齐：同一组内 = 与 用时 的显示列一致（中文按 2 倍宽度）
+    header, lines, tail = render_group_lines(1, 10 ** 2, rows, 3, scanned, None)
+    eq_cols = {disp_width(l.split(" = ")[0]) for l, _t in lines}
+    use_cols = {disp_width(l.split("用时")[0]) for l, _t in lines}
+    assert len(eq_cols) == 1 and len(use_cols) == 1, (eq_cols, use_cols)
+    print("组内对齐 OK")
     # 限时路径：60 位半素数 1 秒内应超时
     random.seed(7)
     semi = (_next_prime(random.randrange(10 ** 29, 10 ** 30) | 1)
@@ -1226,25 +1317,30 @@ def selftest():
     sk = threading.Event()
     sk.set()
     try:
-        factorize(semi, Ctl(stop_event=threading.Event(), skip_event=sk,
-                            deadline=None))
+        factorize(semi, Ctl(stop_event=threading.Event(), skip_event=sk, deadline=None))
         raise AssertionError("应触发跳过")
     except SkipRequested:
         pass
     print("跳过路径 OK")
+    # 大数量级扫描 1 秒内应超时（未找满 3 个质数）
+    rows, pf, scanned, stop = scan_magnitude(
+        103, 10 ** 104, "full", Ctl(deadline=time.perf_counter() + 1.0))
+    assert stop == "timeout" and pf < 3 and scanned > 0, (stop, pf, scanned)
+    print("大数量级限时 OK")
     selftest_pool()
     selftest_skip_in_pool(semi)
     print("SELFTEST OK")
 
 
 def selftest_pool():
-    """多进程流水线：顺序、完整性。"""
-    N = 10 ** 6
+    """多进程流水线：顺序、完整性、每组 3 个质数。"""
+    N = 10 ** 3
     out_q = queue_mod.Queue()
     runner = PoolRunner(N, limit=10, mode="full", workers=4, out_q=out_q)
     runner.start()
     slots = {}
     nxt = 0
+    total_primes = 0
     summary = None
     deadline = time.time() + 120
     while summary is None and time.time() < deadline:
@@ -1253,16 +1349,32 @@ def selftest_pool():
         except queue_mod.Empty:
             continue
         if msg[0] == "slot":
-            slots[msg[1]] = (msg[2], msg[3])
+            slots[msg[1]] = msg[2]
             while nxt in slots:
-                slots.pop(nxt)
+                content = slots.pop(nxt)
+                total_primes += sum(1 for _t, tag in content if tag == "prime")
                 nxt += 1
         elif msg[0] == "summary":
             summary = msg
     runner.close()
     assert summary is not None, "流水线未在限时内完成"
-    assert nxt == 7 + count_numbers(N), (nxt, 7 + count_numbers(N))  # 7 个数量级标题 + 19 个数
-    print("多进程流水线（顺序+完整性）OK")
+    assert nxt == len(str(N)), (nxt, len(str(N)))     # 每个数量级一组
+    # k=0,1,2 组各找到 3 个质数；k=3 组只有 1000 一个数（N=10^3），找不到质数
+    assert total_primes == 9, total_primes
+    print("多进程流水线（顺序+每组 3 质数）OK")
+
+
+def _wait_group_result(result_q, timeout):
+    """从结果队列取下一个 group 结果（跳过进度消息）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            msg = result_q.get(timeout=1.0)
+        except queue_mod.Empty:
+            continue
+        if msg[0] == "result":
+            return msg
+    raise AssertionError("等待超时，未收到 group 结果")
 
 
 def selftest_skip_in_pool(semi):
@@ -1274,18 +1386,19 @@ def selftest_skip_in_pool(semi):
     skip_ev = ctx.Event()
     p = ctx.Process(target=_pool_worker, args=(task_q, result_q, stop_ev, skip_ev))
     p.start()
-    task_q.put((0, semi, None, "full"))
-    time.sleep(1.5)
+    task_q.put((0, 1, 10 ** 40, None, "full"))   # k=1 组：从 10 扫起，17 处找满 3 个质数（很快完成）
+    msg = _wait_group_result(result_q, 60)
+    assert msg[2] == "group", msg
+    # 不限时的大数量级组：k=500（1663 位），找 3 个质数平均要扫描上千个数、
+    # 每个数试除上万次，短时间内不可能完成 → 只能靠跳过打断
+    task_q.put((1, 500, 10 ** 501, None, "full"))
+    time.sleep(5.0)
     skip_ev.set()
-    msg = result_q.get(timeout=60)
-    assert msg[0] == "result" and msg[2] == "skipped", msg
-    skip_ev.clear()
-    stop_ev.clear()
-    task_q.put((1, semi, None, "two"))
-    time.sleep(1.5)
-    stop_ev.set()
-    msg = result_q.get(timeout=60)
-    assert msg[0] == "result" and msg[2] == "stopped", msg
+    msg = _wait_group_result(result_q, 120)
+    assert msg[2] == "group", msg
+    payload = msg[3]
+    _header, _lines, tail, pf, scanned = payload
+    assert pf < 3 and scanned > 0, (pf, scanned)
     task_q.put(None)
     p.join(timeout=10)
     if p.is_alive():
