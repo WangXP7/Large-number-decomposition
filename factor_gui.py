@@ -178,7 +178,7 @@ def is_prime(n, ctl=None):
                 return False
         if ctl is not None and bi < len(bases):
             eta = (time.perf_counter() - tb) * (len(bases) - bi)
-            ctl.note(f"MR 素性检测：底数 {bi}/{len(bases)}（预计还需 ~{eta:.0f} 秒）")
+            ctl.note(f"正在验证是否为质数（第 {bi}/{len(bases)} 轮，预计还需 ~{eta:.0f} 秒）")
     return True
 
 
@@ -195,7 +195,7 @@ def pollard_pm1(n, ctl):
         a = pow(a, pk, n)
         if ctl is not None and i % 512 == 0:
             ctl.check()
-            ctl.note(f"p-1 预处理：{i}/{total}")
+            ctl.note(f"正在用 p-1 方法找因子（进度 {i}/{total}）")
     g = math.gcd(a - 1, n)
     return g if 1 < g < n else None
 
@@ -242,7 +242,8 @@ def pollard_brent(n, ctl):
                 if ctl is not None:
                     ctl.check()
                     rate = steps / max(ctl.elapsed(), 1e-9)
-                    ctl.note(f"rho 找因子：已试 {_fmt_wan(steps)} 步 · 约 {_fmt_wan(rate)} 步/秒")
+                    ctl.note(f"正在用随机算法找因子（已试 {_fmt_wan(steps)} 步 · "
+                             f"约 {_fmt_wan(rate)} 步/秒）——这类因子可能要找很久")
             r <<= 1
         if g == n:
             g = 1
@@ -287,7 +288,7 @@ def factorize(n, ctl):
                 continue
             if ctl is not None:
                 ctl.check()
-                ctl.note(f"试除完成，剩余 {len(str(m))} 位，转入素性检测/随机算法")
+                ctl.note(f"小因子试除完成，剩余 {len(str(m))} 位，开始验证是否质数 / 找因子")
             pr = is_prime(m, ctl)
             if pr is True:
                 factors[m] = factors.get(m, 0) + 1
@@ -398,7 +399,7 @@ def scan_magnitude(k, N, mode, ctl, detail=False):
     stop_kind = None
     n = 10 ** k
     if ctl is not None:
-        ctl.note(f"数量级 10^{k}：开始逐个扫描，目标前 {PRIMES_PER_GROUP} 个质数")
+        ctl.note(f"数量级 10^{k}：开始逐个检查，目标前 {PRIMES_PER_GROUP} 个质数")
     try:
         while primes_found < PRIMES_PER_GROUP and n <= N:
             if ctl is not None:
@@ -412,14 +413,14 @@ def scan_magnitude(k, N, mode, ctl, detail=False):
                 if detail and ctl is not None and ctl.prog is not None:
                     try:
                         ctl.prog.put(("milestone", ctl.seq,
-                                      f"{pretty_num(n)} 是质数（本组第 {primes_found} 个，"
-                                      f"累计扫描 {scanned} 个数）"))
+                                      f"找到本组第 {primes_found} 个质数：{pretty_num(n)}"
+                                      f"（已检查 {scanned} 个数）"))
                     except Exception:
                         pass
             rows.append((n, kind, a, b, dt))
             n += 1
             if ctl is not None:
-                ctl.note(f"已扫描 {scanned} 个数，找到 {primes_found}/{PRIMES_PER_GROUP} 个质数")
+                ctl.note(f"已检查 {scanned} 个数，找到 {primes_found}/{PRIMES_PER_GROUP} 个质数")
     except FactorTimeout:
         stop_kind = "timeout"
     except StopRequested:
@@ -482,22 +483,22 @@ HARD_KINDS = ("timeout", "stopped", "skipped", "fullhard", "twofail")
 def fact_text(kind, a, b):
     """单个数的分解式文本（不含用时）。"""
     if kind == "unit":
-        return "1（单位，非质数非合数）"
+        return "1（单位：既不是质数也不是合数）"
     if kind == "prime":
         return "质数"
     if kind == "two":
         return f"{pretty_num(a)} × {pretty_num(b)}"
     if kind == "twofail":
-        return "？【限时内未找到非平凡因子，未能证明是合数】"
+        return "？【限时内没找到任何因子——无法确定它是质数还是合数】"
     if kind in HARD_KINDS:
-        note = {"timeout": "【限时内未能完全分解】",
-                "stopped": "【已停止】",
-                "skipped": "【已跳过】",
-                "fullhard": "【位数过大，仅试除到 10^5，未能完全分解】",
-                "twofail": "【限时内未找到非平凡因子】"}[kind]
+        note = {"timeout": "【限时内未能完全分解——剩余部分可能是质数，也可能是两个大质数的乘积】",
+                "stopped": "【已停止，未算完】",
+                "skipped": "【已跳过，未算完】",
+                "fullhard": "【数太大，只做了小因子试除，剩余部分未分解】",
+                "twofail": "【限时内没找到任何因子——无法确定它是质数还是合数】"}[kind]
         base = fmt_factors(a) if a else ""
         if b:
-            rp = " × ".join(f"{pretty_num(r, 44)}（{len(str(r))}位）" for r in b)
+            rp = " × ".join(f"剩余 {len(str(r))} 位大数（{pretty_num(r, 36)}）" for r in b)
             body = f"{base} × {rp}{note}" if base else rp + note
         else:
             body = (base + note) if base else note
@@ -543,14 +544,14 @@ def render_group_lines(k, N, rows, primes_found, scanned, stop_kind, detail=Fals
         lines.append((f"  —— 另扫描合数 {n_comp} 个，均已按所选模式分解完毕"
                       f"（勾选「列出合数明细」可逐个查看）\n", "muted"))
     if stop_kind is not None:
-        note = {"timeout": f"【本组限时到：扫过 {scanned} 个数，找到 {primes_found}/{PRIMES_PER_GROUP} 个质数】",
-                "stopped": f"【已停止：扫过 {scanned} 个数，找到 {primes_found}/{PRIMES_PER_GROUP} 个质数】",
-                "skipped": f"【已跳过本组：扫过 {scanned} 个数，找到 {primes_found}/{PRIMES_PER_GROUP} 个质数】"}[stop_kind]
+        note = {"timeout": f"【本组限时已到：检查了 {scanned} 个数，只找到 {primes_found}/{PRIMES_PER_GROUP} 个质数——可调大「每组限时」或选「不限时」重跑】",
+                "stopped": f"【已停止：检查了 {scanned} 个数，找到 {primes_found}/{PRIMES_PER_GROUP} 个质数】",
+                "skipped": f"【已跳过本组：检查了 {scanned} 个数，找到 {primes_found}/{PRIMES_PER_GROUP} 个质数】"}[stop_kind]
         tail = (f"  {note}\n", "hard")
     elif primes_found >= PRIMES_PER_GROUP:
-        tail = (f"  —— 本组共扫描 {scanned} 个数，找到前 {PRIMES_PER_GROUP} 个质数\n", "muted")
+        tail = (f"  —— 本组共检查 {scanned} 个数，找到前 {PRIMES_PER_GROUP} 个质数\n", "muted")
     else:
-        tail = (f"  —— 已扫到 N，本组共 {scanned} 个数，质数 {primes_found} 个\n", "muted")
+        tail = (f"  —— 已到 N，本组共检查 {scanned} 个数，质数 {primes_found} 个\n", "muted")
     return header, lines, tail
 
 
@@ -767,25 +768,25 @@ class PoolRunner:
     def _phase_of(text):
         """从最新进度文本推断当前阶段（用于状态栏与进度行）。"""
         if not text:
-            return "扫描中"
-        if "rho" in text:
-            return "找因子"
-        if "MR" in text or "试除完成" in text:
-            return "素性检测"
+            return "逐个检查中"
+        if "随机算法" in text or "rho" in text:
+            return "寻找因子"
         if "p-1" in text:
-            return "p-1 预处理"
-        return "扫描中"
+            return "预处理找因子"
+        if "验证" in text or "试除完成" in text:
+            return "验证是否质数"
+        return "逐个检查中"
 
     def _post_status(self):
         now = time.perf_counter()
         items = []
-        for _seq, (k, _pretty, t) in sorted(self._outstanding.items())[:6]:
+        for _seq, (k, _pretty, t) in sorted(self._outstanding.items())[:5]:
             detail = self._prog_detail.get(_seq)
             phase = self._phase_of(detail[1] if detail else None)
-            items.append(f"10^{k} {now - t:.0f}s {phase}")
+            items.append(f"数量级 10^{k}（已 {now - t:.0f} 秒，{phase}）")
         infl = "｜".join(items)
-        txt = (f"已完成 {self._done}/{self._total} 组 · 已扫描 {self._stats['scanned']} 个数"
-               + (f" · 进行中：{infl}" if infl else "")
+        txt = (f"已完成 {self._done}/{self._total} 个数量级 · 已检查 {self._stats['scanned']} 个数"
+               + (f" · 正在算：{infl}" if infl else "")
                + (" · 已暂停" if self._paused else "")
                + (" · 正在停止…" if self._stop_flag else "")
                + (" · 已请求跳过当前…" if self._skip_wait else ""))
@@ -793,17 +794,17 @@ class PoolRunner:
         self.out_q.put(("outstanding", len(self._outstanding)))
 
     def _post_progress_line(self, now):
-        """把所有进行中组的概要合并成一行（界面原地对齐刷新，不刷屏）。"""
+        """把所有进行中组的概要合并成一行（界面原地刷新，不刷屏）。"""
         if not self._outstanding:
-            line = "[进行中] 等待计算结果…"
+            line = "[正在计算] 等待计算结果…"
         else:
             items = []
             for seq, (k, _pretty, t) in sorted(self._outstanding.items())[:8]:
                 detail = self._prog_detail.get(seq)
                 phase = self._phase_of(detail[1] if detail else None)
-                items.append(f"10^{k} {now - t:.0f}s {phase}")
+                items.append(f"10^{k}（已 {now - t:.0f} 秒，{phase}）")
             more = len(self._outstanding) - len(items)
-            line = (f"[进行中] 共 {len(self._outstanding)} 组："
+            line = (f"[正在计算] 共 {len(self._outstanding)} 组："
                     + "｜".join(items)
                     + (f" …等 {more} 组" if more > 0 else ""))
         self.out_q.put(("progress_line", line))
@@ -871,19 +872,19 @@ class PoolRunner:
         self._finished = True
         wall = time.perf_counter() - self._t0
         s = self._stats
-        mode_txt = "完整质因数分解" if self.mode == "full" else "仅分解为两数相乘（证合数）"
-        limit_txt = "不限时" if not self.limit else f"每组限时 {self.limit}s"
+        mode_txt = "完整质因数分解" if self.mode == "full" else "只分解成两数相乘（证明是合数即可）"
+        limit_txt = "不限时" if not self.limit else f"每组限时 {self.limit} 秒"
         head = "已停止" if self._stop_flag else "全部完成"
         summary = (
             "\n" + "═" * 78 + "\n"
-            + f"{head}｜模式：{mode_txt}｜{self.workers} 进程｜{limit_txt}\n"
-            + f"共处理 {s['n']}/{self._total} 个数量级 · 扫描 {s['scanned']} 个数 · "
-            + f"质数 {s['prime']} 个 · 未完成/跳过 {s['partial']} 组\n"
-            + f"分解总计用时：{fmt_time(s['fact'])}（从开始到结束共 {fmt_time(wall)}）\n")
-        status = (f"{head} · 共 {s['n']}/{self._total} 组 · 扫描 {s['scanned']} 个数 · "
-                  + f"质数 {s['prime']} 个"
-                  + (f" · 未完成/跳过 {s['partial']} 组" if s["partial"] else "")
-                  + f" · 分解总计用时 {fmt_time(s['fact'])}")
+            + f"{head}｜模式：{mode_txt}｜{self.workers} 个进程同时计算｜{limit_txt}\n"
+            + f"共检查 {s['n']}/{self._total} 个数量级、{s['scanned']} 个数："
+            + f"找到质数 {s['prime']} 个；没找满 3 个质数的数量级有 {s['partial']} 个"
+            + "（多为限时所致，可调大每组限时或选「不限时」重跑）\n"
+            + f"分解计算总用时 {fmt_time(s['fact'])}（从开始到结束共 {fmt_time(wall)}）\n")
+        status = (f"{head} · 已检查 {s['n']}/{self._total} 个数量级 · 质数 {s['prime']} 个"
+                  + (f" · 没找满 3 个质数 {s['partial']} 组" if s["partial"] else "")
+                  + f" · 分解计算总用时 {fmt_time(s['fact'])}")
         self.out_q.put(("summary", summary, status))
 
 
@@ -1096,13 +1097,12 @@ class App:
         ttk.Checkbutton(mid, text="列出合数明细（默认紧凑：只列质数+合数摘要）",
                         variable=self.var_detail).pack(side="left", padx=(14, 0))
 
-        hint = ("说明：对每个数量级 10^k（k = 0,1,2,…），从 10^k 起逐个向上扫描，找出该数量级的"
-                "前 3 个质数（可能要测试很多个数）；途中经过的合数也按所选模式分解"
-                "（默认只显示质数与合数总数，勾选「列出合数明细」可逐个查看，不超过 N）。"
-                "质数红色标出；限时未完成/跳过的橙色标出；大数以 10^n、10^n+d 或 a.bc×10^n 缩写显示。"
-                "输入框可下拉选择 10^50、2^64 等常用值，也可直接粘贴整数。"
-                "慢任务的实时进度合并在结果框下方的一行绿字里原地刷新（找因子 rho 为随机算法，"
-                "无法给出可靠的剩余时间估计），每找到一个质数会单独提示一行。")
+        hint = ("程序会为每个数量级（个位、十位、百位…共 N 的位数个）找出前 3 个质数：从 10^k 起"
+                "一个一个往上检查，途中遇到的合数也会按所选模式分解。默认只显示质数和合数总数，"
+                "想看到每个数的分解过程就勾选「列出合数明细」。质数红色、没算完的橙色。"
+                "输入框可下拉选择 10^50、2^64 等常用值，也可以直接粘贴整数。"
+                "算得慢时，进度会实时显示在结果框下方的一行绿字里；「寻找因子」阶段用的是随机算法，"
+                "可能耗时很久且无法准确估计剩余时间，等不到可点「跳过当前」。")
         ttk.Label(root, text=hint, wraplength=1150, justify="left", foreground="#555",
                   padding=(12, 2)).pack(fill="x")
 
@@ -1172,14 +1172,15 @@ class App:
         self.txt.configure(state="normal")
         self.txt.delete("1.0", "end")
         self.txt.configure(state="disabled")
-        mode_txt = "完整质因数分解" if mode == "full" else "仅分解为两数相乘（证合数）"
+        mode_txt = "完整质因数分解" if mode == "full" else "只分解成两数相乘（证明是合数即可）"
         self._append(
-            f"输入 N = {pretty_num(N, 80)}（{len(str(N))} 位）｜模式：{mode_txt}"
-            f"｜{workers} 进程｜每组限时 {'不限时' if limit is None else str(limit) + ' 秒'}"
-            f"｜显示：{'合数明细' if detail else '紧凑（只列质数+合数摘要）'}\n"
-            f"规则：每个数量级 10^k 从 10^k 起逐个扫描，找出前 {PRIMES_PER_GROUP} 个质数"
-            f"（途中合数{'逐一列出' if detail else '计入组末摘要'}）；\n"
-            "      红色 = 质数；橙色 = 限时未完成/已跳过；缩写：10^n、10^n+d、a.bc×10^n。\n"
+            f"目标：每个数量级 10^k 从 10^k 起逐个检查，找出前 {PRIMES_PER_GROUP} 个质数"
+            f"（途中合数也按模式分解，{'逐一列出' if detail else '折叠为组末摘要'}）\n"
+            f"本次设置：N = {pretty_num(N, 80)}（{len(str(N))} 位）｜{mode_txt}｜"
+            f"{workers} 个进程｜每组限时 {'不限时' if limit is None else str(limit) + ' 秒'}\n"
+            "怎么读结果：红色 = 质数；橙色 = 限时内没算完或已跳过；"
+            "剩余大数「可能是质数，也可能是两个大质数的乘积」；\n"
+            "　　　　　　大数用缩写：10^21 = 1 后面 21 个 0，10^21+1 = 10^21 加 1，5×10^103 = 5 后面 103 个 0。\n"
             + "─" * 78 + "\n", None)
         self.btn_start["state"] = "disabled"
         for b in (self.btn_pause, self.btn_stop):
