@@ -178,7 +178,7 @@ def is_prime(n, ctl=None):
                 return False
         if ctl is not None and bi < len(bases):
             eta = (time.perf_counter() - tb) * (len(bases) - bi)
-            ctl.note(f"素性检测 Miller-Rabin：底数 {bi}/{len(bases)}（预计还需 ~{eta:.1f} s）")
+            ctl.note(f"MR 素性检测：底数 {bi}/{len(bases)}（预计还需 ~{eta:.0f} 秒）")
     return True
 
 
@@ -195,9 +195,18 @@ def pollard_pm1(n, ctl):
         a = pow(a, pk, n)
         if ctl is not None and i % 512 == 0:
             ctl.check()
-            ctl.note(f"Pollard p-1 阶段：{i}/{total} 个素数幂")
+            ctl.note(f"p-1 预处理：{i}/{total}")
     g = math.gcd(a - 1, n)
     return g if 1 < g < n else None
+
+
+def _fmt_wan(x):
+    """按“万”为单位的友好计数。"""
+    if x >= 1e8:
+        return f"{x / 1e8:.2f} 亿"
+    if x >= 1e4:
+        return f"{x / 1e4:.0f} 万"
+    return f"{x:.0f}"
 
 
 def pollard_brent(n, ctl):
@@ -233,8 +242,7 @@ def pollard_brent(n, ctl):
                 if ctl is not None:
                     ctl.check()
                     rate = steps / max(ctl.elapsed(), 1e-9)
-                    ctl.note(f"Pollard rho：第 {restarts} 轮随机重启，累计 {steps} 步"
-                             f"（约 {rate / 1e4:.0f} 万步/秒）——随机算法，剩余时间无法可靠预估")
+                    ctl.note(f"rho 找因子：已试 {_fmt_wan(steps)} 步 · 约 {_fmt_wan(rate)} 步/秒")
             r <<= 1
         if g == n:
             g = 1
@@ -400,6 +408,13 @@ def scan_magnitude(k, N, mode, ctl):
             scanned += 1
             if kind == "prime":
                 primes_found += 1
+                if ctl is not None and ctl.prog is not None:
+                    try:
+                        ctl.prog.put(("milestone", ctl.seq,
+                                      f"{pretty_num(n)} 是质数（本组第 {primes_found} 个，"
+                                      f"累计扫描 {scanned} 个数）"))
+                    except Exception:
+                        pass
             rows.append((n, kind, a, b, dt))
             n += 1
             if ctl is not None:
@@ -625,6 +640,7 @@ class PoolRunner:
         self._exhausted = False
         self._finished = False
         self._outstanding = {}        # seq -> (k, pretty, t_submit)
+        self._prog_detail = {}        # seq -> (elapsed, 最新进度文本)
         self._pending_item = None
         self._seq = 0
         self._items = None
@@ -708,6 +724,7 @@ class PoolRunner:
     def _on_result(self, msg):
         _, seq, kind, a, b, dt = msg
         info = self._outstanding.pop(seq, None)
+        self._prog_detail.pop(seq, None)
         if info is None:
             return
         if kind == "group":
@@ -731,11 +748,27 @@ class PoolRunner:
             self._skip_event.clear()
             self._skip_wait = False
 
+    @staticmethod
+    def _phase_of(text):
+        """从最新进度文本推断当前阶段（用于状态栏与进度行）。"""
+        if not text:
+            return "扫描中"
+        if "rho" in text:
+            return "找因子"
+        if "MR" in text or "试除完成" in text:
+            return "素性检测"
+        if "p-1" in text:
+            return "p-1 预处理"
+        return "扫描中"
+
     def _post_status(self):
         now = time.perf_counter()
-        infl = "｜".join(f"{pretty}（{now - t:.1f}s）"
-                         for _seq, (_k, pretty, t) in
-                         sorted(self._outstanding.items())[:6])
+        items = []
+        for _seq, (k, _pretty, t) in sorted(self._outstanding.items())[:6]:
+            detail = self._prog_detail.get(_seq)
+            phase = self._phase_of(detail[1] if detail else None)
+            items.append(f"10^{k} {now - t:.0f}s {phase}")
+        infl = "｜".join(items)
         txt = (f"已完成 {self._done}/{self._total} 组 · 已扫描 {self._stats['scanned']} 个数"
                + (f" · 进行中：{infl}" if infl else "")
                + (" · 已暂停" if self._paused else "")
@@ -744,9 +777,26 @@ class PoolRunner:
         self.out_q.put(("status", txt))
         self.out_q.put(("outstanding", len(self._outstanding)))
 
+    def _post_progress_line(self, now):
+        """把所有进行中组的概要合并成一行（界面原地对齐刷新，不刷屏）。"""
+        if not self._outstanding:
+            line = "[进行中] 等待计算结果…"
+        else:
+            items = []
+            for seq, (k, _pretty, t) in sorted(self._outstanding.items())[:8]:
+                detail = self._prog_detail.get(seq)
+                phase = self._phase_of(detail[1] if detail else None)
+                items.append(f"10^{k} {now - t:.0f}s {phase}")
+            more = len(self._outstanding) - len(items)
+            line = (f"[进行中] 共 {len(self._outstanding)} 组："
+                    + "｜".join(items)
+                    + (f" …等 {more} 组" if more > 0 else ""))
+        self.out_q.put(("progress_line", line))
+
     def _feeder_loop(self):
         try:
             last_status = 0.0
+            last_prog_line = 0.0
             while True:
                 while True:                      # 1) 收结果/进度
                     try:
@@ -757,17 +807,23 @@ class PoolRunner:
                         break
                     if msg[0] == "prog":
                         _, seq, elapsed, text = msg
+                        self._prog_detail[seq] = (elapsed, text)
+                    elif msg[0] == "milestone":
+                        _, seq, text = msg
                         info = self._outstanding.get(seq)
                         if info:
-                            self.out_q.put(("progline",
-                                            f"    [运行中] {info[1]} 已 {elapsed}s：{text}"))
+                            self.out_q.put(("milestone",
+                                            f"[{info[1]}] {text}"))
                     elif msg[0] == "result":
                         self._on_result(msg)
                 self._refill()                   # 2) 填充任务
-                now = time.perf_counter()        # 3) 状态
+                now = time.perf_counter()        # 3) 状态与进度行
                 if now - last_status >= 0.4:
                     last_status = now
                     self._post_status()
+                if now - last_prog_line >= 1.0:
+                    last_prog_line = now
+                    self._post_progress_line(now)
                 if self._exhausted and not self._outstanding \
                         and self._pending_item is None:
                     break                        # 正常结束
@@ -976,11 +1032,21 @@ class App:
         ttk.Label(sysbar, textvariable=self.var_sys, foreground="#555",
                   wraplength=1150, justify="left").pack(fill="x")
 
+        # 实时进度行：独立于结果文本区，避免与正文穿插（原地去刷新，不刷屏）
+        livebar = ttk.Frame(root, padding=(10, 0))
+        livebar.pack(side="bottom", fill="x")
+        self.var_live = tk.StringVar(value="")
+        ttk.Label(livebar, textvariable=self.var_live, foreground="#2e7d32",
+                  font=("Consolas", 10), wraplength=1150, justify="left").pack(fill="x")
+
         top = ttk.Frame(root, padding=(10, 10, 10, 2))
         top.pack(fill="x")
         ttk.Label(top, text="输入 N：").pack(side="left")
-        self.var_n = tk.StringVar()
-        ent = ttk.Entry(top, textvariable=self.var_n, width=27, font=("Consolas", 11))
+        self.var_n = tk.StringVar(value="10^50")
+        ent = ttk.Combobox(top, textvariable=self.var_n, width=25,
+                           font=("Consolas", 11),
+                           values=["10^12", "10^30", "10^50", "10^100", "10^200",
+                                   "10^500", "2^64", "1e30", "123456789"])
         ent.pack(side="left", padx=(2, 8))
         ent.focus_set()
         ent.bind("<Return>", lambda _e: self.start())
@@ -1014,7 +1080,10 @@ class App:
 
         hint = ("说明：对每个数量级 10^k（k = 0,1,2,…），从 10^k 起逐个向上扫描，找出该数量级的"
                 "前 3 个质数（可能要测试很多个数）；途中经过的合数也按所选模式分解后列出（不超过 N）。"
-                "质数红色标出；限时未完成/跳过的橙色标出；大数以 10^n、10^n+d 或 a.bc×10^n 缩写显示。")
+                "质数红色标出；限时未完成/跳过的橙色标出；大数以 10^n、10^n+d 或 a.bc×10^n 缩写显示。"
+                "输入框可下拉选择 10^50、2^64 等常用值，也可直接粘贴整数。"
+                "慢任务的实时进度合并在结果区底部的一行绿字里原地刷新（找因子 rho 为随机算法，"
+                "无法给出可靠的剩余时间估计），每找到一个质数会单独提示一行。")
         ttk.Label(root, text=hint, wraplength=1150, justify="left", foreground="#555",
                   padding=(12, 2)).pack(fill="x")
 
@@ -1168,8 +1237,11 @@ class App:
                 kind = msg[0]
                 if kind == "slot":
                     self._feed_slot(msg[1], msg[2])
-                elif kind == "progline":
+                elif kind == "milestone":
                     self._append(msg[1] + "\n", "muted")
+                    self.txt.see("end")
+                elif kind == "progress_line":
+                    self.var_live.set(msg[1])
                 elif kind == "status":
                     self.var_status.set(msg[1])
                 elif kind == "outstanding":
@@ -1179,9 +1251,11 @@ class App:
                 elif kind == "sysinfo":
                     self.var_sys.set(msg[1])
                 elif kind == "summary":
+                    self.var_live.set("")
                     self._append(msg[1], None)
                     self._finish(msg[2])
                 elif kind == "error":
+                    self.var_live.set("")
                     self._append("\n" + msg[1] + "\n", "hard")
                     self._finish("出错，详见结果区")
                     messagebox.showerror("错误", msg[1])
@@ -1419,9 +1493,11 @@ def main():
         return
     root = tk.Tk()
     app = App(root)
-    if "--demo" in sys.argv:
-        app.var_n.set("10^12")
-        root.after(800, app.start)   # 演示模式：自动开始分解 10^12
+    demo_val = next((a.split("=", 1)[1] for a in sys.argv
+                     if a.startswith("--demo=")), "10^12" if "--demo" in sys.argv else None)
+    if demo_val is not None:
+        app.var_n.set(demo_val)
+        root.after(800, app.start)   # 演示模式：自动开始
     root.mainloop()
 
 
