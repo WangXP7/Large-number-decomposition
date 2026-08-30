@@ -93,18 +93,27 @@ def _pm1_prime_count():
     return sum(1 for p in get_primes() if p <= PM1_B1)
 
 
-class Ctl:
-    """协同取消（停止/跳过/限时）+ 慢任务进度上报。"""
-    __slots__ = ("stop_event", "skip_event", "deadline", "prog", "seq", "t0", "last_note")
+def _primes_total():
+    return len(get_primes())
 
-    def __init__(self, stop_event=None, skip_event=None, deadline=None, prog=None, seq=0):
+
+class Ctl:
+    """协同取消（停止/跳过/暂停/限时）+ 慢任务进度上报。"""
+    __slots__ = ("stop_event", "skip_event", "pause_event", "deadline", "prog",
+                 "seq", "widx", "t0", "last_note", "last_trial")
+
+    def __init__(self, stop_event=None, skip_event=None, pause_event=None,
+                 deadline=None, prog=None, seq=0, widx=0):
         self.stop_event = stop_event
         self.skip_event = skip_event
+        self.pause_event = pause_event
         self.deadline = deadline
         self.prog = prog            # mp.Queue；None 表示不上报进度（如自检）
         self.seq = seq
+        self.widx = widx
         self.t0 = time.perf_counter()
         self.last_note = 0.0
+        self.last_trial = 0.0
 
     def elapsed(self):
         return time.perf_counter() - self.t0
@@ -114,6 +123,14 @@ class Ctl:
             raise SkipRequested()
         if self.stop_event is not None and self.stop_event.is_set():
             raise StopRequested()
+        if self.pause_event is not None and self.pause_event.is_set():
+            # 真·暂停：就地冻结，期间仍响应停止/跳过
+            while self.pause_event.is_set():
+                if self.stop_event is not None and self.stop_event.is_set():
+                    raise StopRequested()
+                if self.skip_event is not None and self.skip_event.is_set():
+                    raise SkipRequested()
+                time.sleep(0.1)
         if self.deadline is not None and time.perf_counter() >= self.deadline:
             raise FactorTimeout()
 
@@ -126,7 +143,21 @@ class Ctl:
             return
         self.last_note = now
         try:
-            self.prog.put(("prog", self.seq, round(now - self.t0, 1), text))
+            self.prog.put(("prog", self.seq, self.widx, round(now - self.t0, 1), text))
+        except Exception:
+            pass
+
+    def trial(self, idx, total, p):
+        """试除进度：当前试到第几个素数（限速每秒最多 10 次）。"""
+        if self.prog is None:
+            return
+        now = time.perf_counter()
+        if now - self.last_trial < 0.1:
+            return
+        self.last_trial = now
+        try:
+            self.prog.put(("trial", self.seq, self.widx,
+                           f"正在试除找小因子：第 {idx}/{total} 个素数（当前试到 {p}）"))
         except Exception:
             pass
 
@@ -274,11 +305,13 @@ def factorize(n, ctl):
             if m == 1:
                 cur = None
                 continue
-            for pi, p in enumerate(get_primes()):
+            for pi, p in enumerate(get_primes(), 1):
                 if p * p > m:
                     break
                 if pi % 4096 == 0 and ctl is not None:
                     ctl.check()
+                if ctl is not None:
+                    ctl.trial(pi, _primes_total(), p)
                 while m % p == 0:
                     factors[p] = factors.get(p, 0) + 1
                     m //= p
@@ -322,11 +355,13 @@ def factorize_two(n, ctl):
     """
     if n % 2 == 0:
         return (2, n // 2)
-    for pi, p in enumerate(get_primes()):
+    for pi, p in enumerate(get_primes(), 1):
         if p * p > n:
             break
         if pi % 4096 == 0 and ctl is not None:
             ctl.check()
+        if ctl is not None:
+            ctl.trial(pi, _primes_total(), p)
         if n % p == 0:
             return (p, n // p)
     pr = is_prime(n, ctl)
@@ -406,7 +441,7 @@ def scan_magnitude(k, N, mode, ctl, detail=False):
                 ctl.check()
             if ctl is not None and ctl.prog is not None:
                 try:
-                    ctl.prog.put(("curnum", ctl.seq, pretty_num(n, 40)))
+                    ctl.prog.put(("curnum", ctl.seq, ctl.widx, pretty_num(n, 40)))
                 except Exception:
                     pass
             t1 = time.perf_counter()
@@ -415,9 +450,9 @@ def scan_magnitude(k, N, mode, ctl, detail=False):
             scanned += 1
             if kind == "prime":
                 primes_found += 1
-                if detail and ctl is not None and ctl.prog is not None:
+                if ctl is not None and ctl.prog is not None:
                     try:
-                        ctl.prog.put(("milestone", ctl.seq,
+                        ctl.prog.put(("milestone", ctl.seq, ctl.widx,
                                       f"找到本组第 {primes_found} 个质数：{pretty_num(n)}"
                                       f"（已检查 {scanned} 个数）"))
                     except Exception:
@@ -601,22 +636,24 @@ def parse_input(text):
 
 # ------------------------------------------------------------------ 多进程计算
 
-def _do_group_task(seq, k, N, limit, mode, detail, stop_event, skip_event, result_q):
+def _do_group_task(seq, k, N, limit, mode, detail,
+                   stop_event, skip_event, pause_event, widx, result_q):
     """在计算进程里处理一个数量级：扫描并渲染好整组行。"""
     deadline = None if not limit else time.perf_counter() + limit
-    ctl = Ctl(stop_event, skip_event, deadline, prog=result_q, seq=seq)
+    ctl = Ctl(stop_event, skip_event, pause_event, deadline,
+              prog=result_q, seq=seq, widx=widx)
     t1 = time.perf_counter()
     try:
         rows, pf, scanned, stop_kind = scan_magnitude(k, N, mode, ctl, detail)
         header, lines, tail = render_group_lines(k, N, rows, pf, scanned, stop_kind, detail)
         payload = (header, lines, tail, pf, scanned)
-        return ("result", seq, "group", payload, None, time.perf_counter() - t1)
+        return ("result", seq, widx, "group", payload, None, time.perf_counter() - t1)
     except Exception as e:
-        return ("result", seq, "gerror", f"{type(e).__name__}: {e}", None,
+        return ("result", seq, widx, "gerror", f"{type(e).__name__}: {e}", None,
                 time.perf_counter() - t1)
 
 
-def _pool_worker(task_q, result_q, stop_event, skip_event):
+def _pool_worker(task_q, result_q, stop_event, skip_event, pause_event, widx):
     """计算进程主循环：取任务 → 计算 → 回传；收到 None 哨兵退出。"""
     while True:
         try:
@@ -628,9 +665,9 @@ def _pool_worker(task_q, result_q, stop_event, skip_event):
         seq, k, N, limit, mode, detail = task
         try:
             res = _do_group_task(seq, k, N, limit, mode, detail,
-                                 stop_event, skip_event, result_q)
+                                 stop_event, skip_event, pause_event, widx, result_q)
         except Exception as e:
-            res = ("result", seq, "gerror", repr(e), None, 0.0)
+            res = ("result", seq, widx, "gerror", repr(e), None, 0.0)
         try:
             result_q.put(res)
         except Exception:
@@ -668,6 +705,8 @@ class PoolRunner:
         self._outstanding = {}        # seq -> (k, pretty, t_submit)
         self._prog_detail = {}        # seq -> (elapsed, 最新进度文本)
         self._curnum = {}             # seq -> (正在算的数, 该数开始时刻)
+        self._widx = {}               # seq -> 计算进程编号
+        self._skip_hold = False       # 跳过进行中：暂停派发新任务，防止级联跳过
         self._pending_item = None
         self._seq = 0
         self._items = None
@@ -682,10 +721,12 @@ class PoolRunner:
         self._result_q = ctx.Queue()
         self._stop_event = ctx.Event()
         self._skip_event = ctx.Event()
-        for _ in range(self.workers):
+        self._pause_event = ctx.Event()
+        for widx in range(self.workers):
             p = ctx.Process(target=_pool_worker,
                             args=(self._task_q, self._result_q,
-                                  self._stop_event, self._skip_event),
+                                  self._stop_event, self._skip_event,
+                                  self._pause_event, widx),
                             daemon=True)
             p.start()
             self._procs.append(p)
@@ -701,14 +742,19 @@ class PoolRunner:
 
     def pause(self):
         self._paused = True
+        if self._pause_event is not None:
+            self._pause_event.set()      # 真·暂停：正在算的组就地冻结
 
     def resume(self):
         self._paused = False
+        if self._pause_event is not None:
+            self._pause_event.clear()
 
     def skip_current(self):
         if self._outstanding:
             self._skip_event.set()
             self._skip_wait = True
+            self._skip_hold = True       # 暂停派发新任务，防止新组被级联跳过
 
     def stop(self):
         self._stop_flag = True
@@ -733,7 +779,7 @@ class PoolRunner:
     # ---------------- 内部 ----------------
 
     def _refill(self):
-        while not self._stop_flag and not self._paused \
+        while not self._stop_flag and not self._paused and not self._skip_hold \
                 and len(self._outstanding) < self.workers and not self._exhausted:
             if self._pending_item is None:
                 try:
@@ -749,10 +795,11 @@ class PoolRunner:
             self._pending_item = None
 
     def _on_result(self, msg):
-        _, seq, kind, a, b, dt = msg
+        _, seq, _widx, kind, a, b, dt = msg
         info = self._outstanding.pop(seq, None)
         self._prog_detail.pop(seq, None)
         self._curnum.pop(seq, None)
+        self._widx.pop(seq, None)
         if info is None:
             return
         if kind == "group":
@@ -775,12 +822,15 @@ class PoolRunner:
         if self._skip_wait and not self._outstanding:
             self._skip_event.clear()
             self._skip_wait = False
+            self._skip_hold = False
 
     @staticmethod
     def _phase_of(text):
-        """从最新进度文本推断当前阶段（用于状态栏与进度行）。"""
+        """从最新进度文本推断当前阶段（用于状态栏）。"""
         if not text:
             return "逐个检查中"
+        if "试除找小因子" in text:
+            return "试除找小因子"
         if "随机算法" in text or "rho" in text:
             return "寻找因子"
         if "p-1" in text:
@@ -805,24 +855,43 @@ class PoolRunner:
         self.out_q.put(("status", txt))
         self.out_q.put(("outstanding", len(self._outstanding)))
 
+    @staticmethod
+    def _short_status(text):
+        """把最新进度文本压缩成适合放进进度行的短语。"""
+        if not text:
+            return "逐个检查中"
+        if text.startswith("已检查"):
+            return "逐个检查中"
+        if "——" in text:
+            text = text.split("——")[0]
+        return text.rstrip("：: ")
+
     def _post_progress_line(self, now):
-        """进行中的组汇总：一个数量级一行，含正在算的数及其耗时。"""
-        if not self._outstanding:
+        """进行中的组汇总：一个数量级一行，含正在算的数、其耗时与所用进程。"""
+        if self._paused:
+            lines = ["[已暂停] 正在计算的组已就地冻结（点「继续」恢复）"]
+        elif not self._outstanding:
             lines = ["[正在计算] 等待计算结果…"]
         else:
-            lines = []
+            header = (f"[正在计算] 共 {len(self._outstanding)} 组 · "
+                      f"并行 {self.workers} 进程（每组占 1 个）")
+            lines = [header]
             for seq, (k, _pretty, t) in sorted(self._outstanding.items()):
-                if len(lines) >= 12:
-                    lines.append(f"……其余 {len(self._outstanding) - len(lines) + 1} 组进行中")
+                if len(lines) > 12:
+                    lines.append(f"……其余 {len(self._outstanding) - 12} 组进行中")
                     break
                 detail = self._prog_detail.get(seq)
-                phase = self._phase_of(detail[1] if detail else None)
+                status = self._short_status(detail[1] if detail else None)
+                widx = self._widx.get(seq)
+                wtxt = f" · 进程#{widx + 1}" if widx is not None else ""
                 cur = self._curnum.get(seq)
                 if cur:
                     lines.append(f"数量级 10^{k}（本组已 {now - t:.0f} 秒）"
-                                 f"正在算 {cur[0]}（该数已 {now - cur[1]:.0f} 秒，{phase}）")
+                                 f"正在算 {cur[0]}（该数已 {now - cur[1]:.0f} 秒，"
+                                 f"{status}）{wtxt}")
                 else:
-                    lines.append(f"数量级 10^{k}（本组已 {now - t:.0f} 秒，{phase}）")
+                    lines.append(f"数量级 10^{k}（本组已 {now - t:.0f} 秒，"
+                                 f"{status}）{wtxt}")
         self.out_q.put(("progress_lines", lines))
 
     def _feeder_loop(self):
@@ -838,13 +907,20 @@ class PoolRunner:
                     except (OSError, ValueError):
                         break
                     if msg[0] == "prog":
-                        _, seq, elapsed, text = msg
+                        _, seq, widx, elapsed, text = msg
+                        self._widx[seq] = widx
                         self._prog_detail[seq] = (elapsed, text)
+                    elif msg[0] == "trial":
+                        _, seq, widx, text = msg
+                        self._widx[seq] = widx
+                        self._prog_detail[seq] = (None, text)
                     elif msg[0] == "curnum":
-                        _, seq, ntext = msg
+                        _, seq, widx, ntext = msg
+                        self._widx[seq] = widx
                         self._curnum[seq] = (ntext, time.perf_counter())
                     elif msg[0] == "milestone":
-                        _, seq, text = msg
+                        _, seq, widx, text = msg
+                        self._widx[seq] = widx
                         info = self._outstanding.get(seq)
                         if info:
                             self.out_q.put(("milestone",
@@ -1118,15 +1194,35 @@ class App:
 
         hint = ("程序会为每个数量级（个位、十位、百位…共 N 的位数个）找出前 3 个质数：从 10^k 起"
                 "一个一个往上检查，途中遇到的合数也会按所选模式分解。默认只显示质数和合数总数，"
-                "想看到每个数的分解过程就勾选「列出合数明细」。质数红色、没算完的橙色。"
+                "想看到每个数的分解过程就勾选「列出合数明细」。质数红色、没算完的橙色；"
+                "每找到一个质数会记录在右侧「找到质数记录」面板里累积显示。"
                 "输入框可下拉选择 10^50、2^64 等常用值，也可以直接粘贴整数。"
-                "算得慢时，进度会实时显示在结果框下方的一行绿字里；「寻找因子」阶段用的是随机算法，"
-                "可能耗时很久且无法准确估计剩余时间，等不到可点「跳过当前」。")
+                "算得慢时，进度会实时显示在结果框下方的一行绿字区里（每个数量级一行，"
+                "含正在算的数、该数已耗时、试除到哪个素数、所用进程）；「寻找因子」阶段用的是"
+                "随机算法，可能耗时很久且无法准确估计剩余时间，等不到可点「跳过当前」；"
+                "「暂停」会就地冻结正在算的组，「继续」恢复。")
         ttk.Label(root, text=hint, wraplength=1150, justify="left", foreground="#555",
                   padding=(12, 2)).pack(fill="x")
 
-        txtframe = ttk.Frame(root)
-        txtframe.pack(fill="both", expand=True, padx=10, pady=6)
+        body = ttk.Frame(root)
+        body.pack(fill="both", expand=True, padx=10, pady=6)
+
+        # 右侧：质数发现事件面板（累积显示，不与结果混排）
+        evtframe = ttk.Frame(body)
+        evtframe.pack(side="right", fill="y", padx=(8, 0))
+        ttk.Label(evtframe, text="找到质数记录（实时累积）", foreground="#2e7d32",
+                  font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
+        evt_vsb = ttk.Scrollbar(evtframe, orient="vertical")
+        self.evt = tk.Text(evtframe, width=46, font=("Consolas", 9), wrap="word",
+                           state="disabled", bg="#f3faf3",
+                           yscrollcommand=evt_vsb.set)
+        evt_vsb.configure(command=self.evt.yview)
+        evt_vsb.pack(side="right", fill="y")
+        self.evt.pack(fill="both", expand=True)
+
+        # 左侧：结果区
+        txtframe = ttk.Frame(body)
+        txtframe.pack(side="left", fill="both", expand=True)
         hsb = ttk.Scrollbar(txtframe, orient="horizontal")
         vsb = ttk.Scrollbar(txtframe, orient="vertical")
         self.txt = tk.Text(txtframe, font=("Consolas", 10), wrap="none",
@@ -1141,6 +1237,9 @@ class App:
             self.txt.tag_configure(tag, **kw)
 
         root.protocol("WM_DELETE_WINDOW", self._on_close)
+        root.bind("<F9>", lambda _e: self.toggle_pause())
+        root.bind("<F10>", lambda _e: self.skip_current())
+        root.bind("<F11>", lambda _e: self.stop())
         root.after(80, self._poll)
         threading.Thread(target=self._monitor_loop, daemon=True).start()
 
@@ -1191,6 +1290,9 @@ class App:
         self.txt.configure(state="normal")
         self.txt.delete("1.0", "end")
         self.txt.configure(state="disabled")
+        self.evt.configure(state="normal")
+        self.evt.delete("1.0", "end")
+        self.evt.configure(state="disabled")
         mode_txt = "完整质因数分解" if mode == "full" else "只分解成两数相乘（证明是合数即可）"
         self._append(
             f"目标：每个数量级 10^k 从 10^k 起逐个检查，找出前 {PRIMES_PER_GROUP} 个质数"
@@ -1261,6 +1363,13 @@ class App:
             self.txt.insert("end", text)
         self.txt.configure(state="disabled")
 
+    def _evt_append(self, text):
+        """右侧“找到质数记录”面板：累积追加，不覆盖。"""
+        self.evt.configure(state="normal")
+        self.evt.insert("end", text + "\n")
+        self.evt.see("end")
+        self.evt.configure(state="disabled")
+
     def _feed_slot(self, seq, content):
         self._slots[seq] = content
         while self._next_seq in self._slots:
@@ -1280,8 +1389,7 @@ class App:
                 if kind == "slot":
                     self._feed_slot(msg[1], msg[2])
                 elif kind == "milestone":
-                    self._append(msg[1] + "\n", "muted")
-                    self.txt.see("end")
+                    self._evt_append(msg[1])
                 elif kind == "progress_lines":
                     self.var_live.set("\n".join(msg[1]))
                 elif kind == "status":
@@ -1512,19 +1620,21 @@ def selftest_skip_in_pool(semi):
     result_q = ctx.Queue()
     stop_ev = ctx.Event()
     skip_ev = ctx.Event()
-    p = ctx.Process(target=_pool_worker, args=(task_q, result_q, stop_ev, skip_ev))
+    pause_ev = ctx.Event()
+    p = ctx.Process(target=_pool_worker,
+                    args=(task_q, result_q, stop_ev, skip_ev, pause_ev, 0))
     p.start()
     task_q.put((0, 1, 10 ** 40, None, "full", False))   # k=1 组：从 10 扫起，17 处找满 3 个质数（很快完成）
     msg = _wait_group_result(result_q, 60)
-    assert msg[2] == "group", msg
+    assert msg[3] == "group", msg
     # 不限时的大数量级组：k=500（1663 位），找 3 个质数平均要扫描上千个数、
     # 每个数试除上万次，短时间内不可能完成 → 只能靠跳过打断
     task_q.put((1, 500, 10 ** 501, None, "full", False))
     time.sleep(5.0)
     skip_ev.set()
     msg = _wait_group_result(result_q, 120)
-    assert msg[2] == "group", msg
-    payload = msg[3]
+    assert msg[3] == "group", msg
+    payload = msg[4]
     _header, _lines, tail, pf, scanned = payload
     assert pf < 3 and scanned > 0, (pf, scanned)
     task_q.put(None)
