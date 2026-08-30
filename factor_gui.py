@@ -240,6 +240,96 @@ def _fmt_wan(x):
     return f"{x:.0f}"
 
 
+class _EcmFound(Exception):
+    """ECM 过程中模逆失败：携带的 g = gcd(分子, n) 就是 n 的一个因子。"""
+
+    def __init__(self, g):
+        super().__init__(g)
+        self.g = g
+
+
+def _inv(x, n):
+    """扩展欧几里得求逆元；不互素时抛 _EcmFound(gcd)。"""
+    old_r, r = x % n, n
+    old_s, s = 1, 0
+    while r:
+        q = old_r // r
+        old_r, r = r, old_r - q * r
+        old_s, s = s, old_s - q * s
+    if old_r == 1:
+        return old_s % n
+    raise _EcmFound(old_r)
+
+
+def _pt_add(P, Q, a, n):
+    """椭圆曲线点加（仿射坐标），曲线 y² = x³ + a·x + b (mod n)。None 为无穷远点。"""
+    if P is None:
+        return Q
+    if Q is None:
+        return P
+    x1, y1 = P
+    x2, y2 = Q
+    if x1 == x2:
+        if (y1 + y2) % n == 0:
+            return None
+        lam = (3 * x1 * x1 + a) * _inv(2 * y1, n) % n
+    else:
+        lam = (y2 - y1) * _inv((x2 - x1) % n, n) % n
+    x3 = (lam * lam - x1 - x2) % n
+    return (x3, (lam * (x1 - x3) - y1) % n)
+
+
+def _pt_mul(k, P, a, n):
+    """椭圆曲线标量乘（双倍-加法）。"""
+    R = None
+    add = P
+    while k:
+        if k & 1:
+            R = _pt_add(R, add, a, n)
+        k >>= 1
+        if k:
+            add = _pt_add(add, add, a, n)
+    return R
+
+
+ECM_MAX_BITS = 10_000        # 超过该位数不做 ECM
+ECM_B1 = 2_000               # ECM 第一阶段界限（纯 Python 演示级，详见算法调研报告）
+ECM_MAX_CURVES = 30          # 最多尝试曲线数
+
+
+def pollard_ecm(n, ctl, b1=ECM_B1, max_curves=ECM_MAX_CURVES):
+    """Lenstra 椭圆曲线分解（ECM，第一阶段，简化仿射实现）。
+
+    找到非平凡因子返回之；曲线用尽返回 None；限时/停止/跳过照常抛异常。
+    """
+    if n % 2 == 0:
+        return 2
+    primes = [p for p in get_primes() if p <= b1]
+    for c in range(max_curves):
+        ctl.check()
+        a = random.randrange(6, n)
+        x0 = random.randrange(1, n)
+        y0 = random.randrange(1, n)
+        b = (y0 * y0 - x0 * x0 * x0 - a * x0) % n
+        P = (x0, y0)
+        try:
+            for p in primes:
+                ctl.check()
+                ctl.note(f"ECM 椭圆曲线：第 {c + 1}/{max_curves} 条曲线，"
+                         f"B1={b1}，当前素数幂 {p}")
+                k = p
+                while k * p <= b1:
+                    k *= p
+                P = _pt_mul(k, P, a, n)
+                if P is None:
+                    break
+        except _EcmFound as e:
+            if 1 < e.g < n:
+                return e.g
+            continue          # g == n：曲线退化，换一条
+    return None
+
+
 def pollard_brent(n, ctl):
     """Pollard rho（Brent 变体），返回 n 的一个非平凡因子。"""
     if n % 2 == 0:
@@ -287,10 +377,12 @@ def pollard_brent(n, ctl):
             return g
 
 
-def factorize(n, ctl):
+def factorize(n, ctl, alg="auto"):
     """完整质因数分解。正常返回 (因子 dict{素数: 次数}, 未分解剩余 list)。
 
+    未分解剩余的元素为 (数, 原因)："toobig"=位数超限，"algfail"=所选算法未能分解。
     限时/停止/跳过时抛对应异常，args = (已分解因子 dict, 剩余未分解 list)。
+    alg：auto（p-1→rho）/ rho / pm1 / ecm / deep（p-1→ECM→rho）。
     """
     factors = {}
     work = [n]
@@ -327,28 +419,51 @@ def factorize(n, ctl):
                 factors[m] = factors.get(m, 0) + 1
                 cur = None
                 continue
-            if pr is None or m.bit_length() > RHO_MAX_BITS:
-                hard.append(m)              # 位数过大，不做进一步分解
+            if pr is None or (alg in ("auto", "rho", "deep")
+                              and m.bit_length() > RHO_MAX_BITS):
+                hard.append((m, "toobig"))
                 cur = None
                 continue
             d = None
-            if m.bit_length() <= PM1_MAX_BITS:
-                d = pollard_pm1(m, ctl)
-            if d is None:
+            if alg == "rho":
                 d = pollard_brent(m, ctl)
+            elif alg == "pm1":
+                d = pollard_pm1(m, ctl) if m.bit_length() <= PM1_MAX_BITS else None
+                if d is None:
+                    hard.append((m, "algfail"))
+                    cur = None
+                    continue
+            elif alg == "ecm":
+                d = pollard_ecm(m, ctl) if m.bit_length() <= ECM_MAX_BITS else None
+                if d is None:
+                    hard.append((m, "algfail"))
+                    cur = None
+                    continue
+            elif alg == "deep":
+                if m.bit_length() <= PM1_MAX_BITS:
+                    d = pollard_pm1(m, ctl)
+                if d is None and m.bit_length() <= ECM_MAX_BITS:
+                    d = pollard_ecm(m, ctl)
+                if d is None:
+                    d = pollard_brent(m, ctl)
+            else:  # auto
+                if m.bit_length() <= PM1_MAX_BITS:
+                    d = pollard_pm1(m, ctl)
+                if d is None:
+                    d = pollard_brent(m, ctl)
             work.append(d)
             work.append(m // d)
             cur = None
     except (FactorTimeout, StopRequested, SkipRequested) as e:
-        rest = [w for w in work if w > 1] + hard
+        rest = [(w, "cut") for w in work if w > 1] + hard
         if cur is not None and cur > 1:
-            rest.append(cur)
+            rest.append((cur, "cut"))
         e.args = (dict(factors), rest)
         raise
     return factors, hard
 
 
-def factorize_two(n, ctl):
+def factorize_two(n, ctl, alg="auto"):
     """仅找一个非平凡因子：返回 (d, n//d) 证明合数；n 是质数返回 None。
 
     无法完成时抛 FactorTimeout（args=(已找到的 d 或 None,)）。
@@ -369,16 +484,22 @@ def factorize_two(n, ctl):
         return None
     if ctl is not None:
         ctl.check()
-        ctl.note("小因子试除完成，转入随机算法找任一因子")
+        ctl.note("小因子试除完成，转入找因子算法")
     try:
-        if n.bit_length() <= PM1_MAX_BITS:
+        if alg in ("auto", "pm1", "deep") and n.bit_length() <= PM1_MAX_BITS:
             d = pollard_pm1(n, ctl)
             if d:
                 return (d, n // d)
-        if n.bit_length() > RHO_MAX_BITS:
-            raise FactorTimeout((None,))
-        d = pollard_brent(n, ctl)
-        return (d, n // d)
+        if alg in ("ecm", "deep") and n.bit_length() <= ECM_MAX_BITS:
+            d = pollard_ecm(n, ctl)
+            if d:
+                return (d, n // d)
+        if alg in ("auto", "rho", "deep"):
+            if n.bit_length() > RHO_MAX_BITS:
+                raise FactorTimeout((None,))
+            d = pollard_brent(n, ctl)
+            return (d, n // d)
+        raise FactorTimeout((None,))    # 所选算法不支持该位数
     except FactorTimeout as e:
         if not e.args:
             e.args = (None,)
@@ -387,20 +508,21 @@ def factorize_two(n, ctl):
 
 # ------------------------------------------------------------------ 数量级扫描（找前 3 个质数）
 
-def classify_number(n, mode, ctl):
+def classify_number(n, mode, ctl, alg="auto"):
     """判定/分解单个数。返回 (kind, a, b)：
     unit / prime / full(合数,因子dict,None) / two(d,余因子) /
     timeout(部分因子,剩余) / twofail(d或None,None) / fullhard / stopped / skipped
+    fullhard 的 b 为 (数, 原因) 列表，原因："toobig" / "algfail"
     """
     if n == 1:
         return ("unit", None, None)
     try:
         if mode == "two":
-            r = factorize_two(n, ctl)
+            r = factorize_two(n, ctl, alg)
             if r is None:
                 return ("prime", None, None)
             return ("two", r[0], r[1])
-        factors, hard = factorize(n, ctl)
+        factors, hard = factorize(n, ctl, alg)
         if hard:
             return ("fullhard", factors, hard)
         if len(factors) == 1 and factors.get(n) == 1:
@@ -409,19 +531,19 @@ def classify_number(n, mode, ctl):
     except FactorTimeout as e:
         if mode == "two":
             return ("twofail", e.args[0] if e.args else None, None)
-        f, r = e.args if len(e.args) == 2 else ({}, [n])
+        f, r = e.args if len(e.args) == 2 else ({}, [(n, "cut")])
         return ("timeout", f, r)
     except StopRequested as e:
         if mode == "two":
             return ("stopped", None, None)
-        f, r = e.args if len(e.args) == 2 else ({}, [n])
+        f, r = e.args if len(e.args) == 2 else ({}, [(n, "cut")])
         return ("stopped", f, r)
     except SkipRequested:
         return ("skipped", None, None)
 
 
-def scan_magnitude(k, N, mode, ctl, detail=False):
-    """一个数量级的扫描任务：从 10^k 起逐个向上，直到找出前 3 个质数。
+def scan_magnitude(k, N, mode, ctl, detail=False, ppn=PRIMES_PER_GROUP, alg="auto"):
+    """一个数量级的扫描任务：从 10^k 起逐个向上，直到找出前 ppn 个质数。
 
     返回 (rows, primes_found, scanned, stop_kind)
     rows: [(num, kind, a, b, dt)]；stop_kind: None / timeout / stopped / skipped
@@ -434,9 +556,9 @@ def scan_magnitude(k, N, mode, ctl, detail=False):
     stop_kind = None
     n = 10 ** k
     if ctl is not None:
-        ctl.note(f"数量级 10^{k}：开始逐个检查，目标前 {PRIMES_PER_GROUP} 个质数")
+        ctl.note(f"数量级 10^{k}：开始逐个检查，目标前 {ppn} 个质数")
     try:
-        while primes_found < PRIMES_PER_GROUP and n <= N:
+        while primes_found < ppn and n <= N:
             if ctl is not None:
                 ctl.check()
             if ctl is not None and ctl.prog is not None:
@@ -445,7 +567,7 @@ def scan_magnitude(k, N, mode, ctl, detail=False):
                 except Exception:
                     pass
             t1 = time.perf_counter()
-            kind, a, b = classify_number(n, mode, ctl)
+            kind, a, b = classify_number(n, mode, ctl, alg)
             dt = time.perf_counter() - t1
             scanned += 1
             if kind == "prime":
@@ -460,7 +582,7 @@ def scan_magnitude(k, N, mode, ctl, detail=False):
             rows.append((n, kind, a, b, dt))
             n += 1
             if ctl is not None:
-                ctl.note(f"已检查 {scanned} 个数，找到 {primes_found}/{PRIMES_PER_GROUP} 个质数")
+                ctl.note(f"已检查 {scanned} 个数，找到 {primes_found}/{ppn} 个质数")
     except FactorTimeout:
         stop_kind = "timeout"
     except StopRequested:
@@ -534,11 +656,20 @@ def fact_text(kind, a, b):
         note = {"timeout": "【限时内未能完全分解——剩余部分可能是质数，也可能是两个大质数的乘积】",
                 "stopped": "【已停止，未算完】",
                 "skipped": "【已跳过，未算完】",
-                "fullhard": "【数太大，只做了小因子试除，剩余部分未分解】",
+                "fullhard": "【未能完全分解——剩余部分可能是质数，也可能是两个大质数的乘积】",
                 "twofail": "【限时内没找到任何因子——无法确定它是质数还是合数】"}[kind]
         base = fmt_factors(a) if a else ""
         if b:
-            rp = " × ".join(f"剩余 {len(str(r))} 位大数（{pretty_num(r, 36)}）" for r in b)
+            parts = []
+            for item in b:
+                if isinstance(item, tuple):
+                    r, why = item
+                    suffix = {"algfail": "【所选算法未能分解，可换其它算法】",
+                              "cut": "【随任务中断】"}.get(why, "")
+                    parts.append(f"剩余 {len(str(r))} 位大数（{pretty_num(r, 36)}）{suffix}")
+                else:
+                    parts.append(f"剩余 {len(str(item))} 位大数（{pretty_num(item, 36)}）")
+            rp = " × ".join(parts)
             body = f"{base} × {rp}{note}" if base else rp + note
         else:
             body = (base + note) if base else note
@@ -555,7 +686,8 @@ def group_header(k, N):
             + "─" * 12 + "\n")
 
 
-def render_group_lines(k, N, rows, primes_found, scanned, stop_kind, detail=False):
+def render_group_lines(k, N, rows, primes_found, scanned, stop_kind,
+                       detail=False, ppn=PRIMES_PER_GROUP):
     """把一个数量级的扫描结果渲染为对齐的行。
 
     返回 (header, [(line, tag)...], tail)。
@@ -589,12 +721,12 @@ def render_group_lines(k, N, rows, primes_found, scanned, stop_kind, detail=Fals
                         for num, _k, _a, _b, dt in slowest)
         lines.append((f"  —— 本组耗时最长的 {len(slowest)} 个数：{ent}\n", "muted"))
     if stop_kind is not None:
-        note = {"timeout": f"【本组限时已到：检查了 {scanned} 个数，只找到 {primes_found}/{PRIMES_PER_GROUP} 个质数——可调大「每组限时」或选「不限时」重跑】",
-                "stopped": f"【已停止：检查了 {scanned} 个数，找到 {primes_found}/{PRIMES_PER_GROUP} 个质数】",
-                "skipped": f"【已跳过本组：检查了 {scanned} 个数，找到 {primes_found}/{PRIMES_PER_GROUP} 个质数】"}[stop_kind]
+        note = {"timeout": f"【本组限时已到：检查了 {scanned} 个数，只找到 {primes_found}/{ppn} 个质数——可调大「每组限时」或选「不限时」重跑】",
+                "stopped": f"【已停止：检查了 {scanned} 个数，找到 {primes_found}/{ppn} 个质数】",
+                "skipped": f"【已跳过本组：检查了 {scanned} 个数，找到 {primes_found}/{ppn} 个质数】"}[stop_kind]
         tail = (f"  {note}\n", "hard")
-    elif primes_found >= PRIMES_PER_GROUP:
-        tail = (f"  —— 本组共检查 {scanned} 个数，找到前 {PRIMES_PER_GROUP} 个质数\n", "muted")
+    elif primes_found >= ppn:
+        tail = (f"  —— 本组共检查 {scanned} 个数，找到前 {ppn} 个质数\n", "muted")
     else:
         tail = (f"  —— 已到 N，本组共检查 {scanned} 个数，质数 {primes_found} 个\n", "muted")
     return header, lines, tail
@@ -636,7 +768,7 @@ def parse_input(text):
 
 # ------------------------------------------------------------------ 多进程计算
 
-def _do_group_task(seq, k, N, limit, mode, detail,
+def _do_group_task(seq, k, N, limit, mode, detail, ppn, alg,
                    stop_event, skip_event, pause_event, widx, result_q):
     """在计算进程里处理一个数量级：扫描并渲染好整组行。"""
     deadline = None if not limit else time.perf_counter() + limit
@@ -644,8 +776,9 @@ def _do_group_task(seq, k, N, limit, mode, detail,
               prog=result_q, seq=seq, widx=widx)
     t1 = time.perf_counter()
     try:
-        rows, pf, scanned, stop_kind = scan_magnitude(k, N, mode, ctl, detail)
-        header, lines, tail = render_group_lines(k, N, rows, pf, scanned, stop_kind, detail)
+        rows, pf, scanned, stop_kind = scan_magnitude(k, N, mode, ctl, detail, ppn, alg)
+        header, lines, tail = render_group_lines(k, N, rows, pf, scanned,
+                                                 stop_kind, detail, ppn)
         payload = (header, lines, tail, pf, scanned)
         return ("result", seq, widx, "group", payload, None, time.perf_counter() - t1)
     except Exception as e:
@@ -662,9 +795,10 @@ def _pool_worker(task_q, result_q, stop_event, skip_event, pause_event, widx):
             return
         if task is None:
             return
-        seq, k, N, limit, mode, detail = task
+        seq, k, N, limit, mode, detail, ppn, alg = task
+        skip_event.clear()    # 新任务开始：清除上一组遗留的跳过标记（按组跳过不级联）
         try:
-            res = _do_group_task(seq, k, N, limit, mode, detail,
+            res = _do_group_task(seq, k, N, limit, mode, detail, ppn, alg,
                                  stop_event, skip_event, pause_event, widx, result_q)
         except Exception as e:
             res = ("result", seq, widx, "gerror", repr(e), None, 0.0)
@@ -684,29 +818,32 @@ class PoolRunner:
       ("summary", text, status_text) / ("error", text)
     """
 
-    def __init__(self, N, limit, mode, workers, out_q, detail=False):
+    def __init__(self, N, limit, mode, workers, out_q, detail=False,
+                 ppn=PRIMES_PER_GROUP, alg="auto"):
         self.N = N
         self.limit = limit            # None = 不限时
         self.mode = mode              # "full" / "two"
         self.detail = detail          # True = 列出全部合数明细
+        self.ppn = max(1, int(ppn))   # 每组要找的质数个数
+        self.alg = alg                # 找因子算法：auto/rho/pm1/ecm/deep
         self.workers = max(1, int(workers))
         self.out_q = out_q
         self.pids = []
+        self.cpu_by_pid = {}          # pid -> 该进程 CPU 占用%（监控线程写入）
         self._procs = []
         self._task_q = None
         self._result_q = None
         self._stop_event = None
-        self._skip_event = None
+        self._skip_events = []        # 每个计算进程独立的跳过事件（支持按组跳过）
+        self._pause_event = None
         self._stop_flag = False
         self._paused = False
-        self._skip_wait = False
         self._exhausted = False
         self._finished = False
         self._outstanding = {}        # seq -> (k, pretty, t_submit)
         self._prog_detail = {}        # seq -> (elapsed, 最新进度文本)
         self._curnum = {}             # seq -> (正在算的数, 该数开始时刻)
         self._widx = {}               # seq -> 计算进程编号
-        self._skip_hold = False       # 跳过进行中：暂停派发新任务，防止级联跳过
         self._pending_item = None
         self._seq = 0
         self._items = None
@@ -715,17 +852,31 @@ class PoolRunner:
         self._total = len(str(N))     # 每个数量级一组
         self._t0 = time.perf_counter()
 
+    def busy_count(self):
+        return len(self._outstanding)
+
+    def skip_one(self, seq):
+        """只跳过指定数量级（该组所在计算进程的独立事件）。"""
+        widx = self._widx.get(seq)
+        if widx is not None and 0 <= widx < len(self._skip_events):
+            self._skip_events[widx].set()
+
+    def skip_all(self):
+        """跳过当前正在计算的所有组（各进程完成当前组后自动恢复接新任务）。"""
+        for e in self._skip_events:
+            e.set()
+
     def start(self):
         ctx = multiprocessing.get_context("spawn")
         self._task_q = ctx.Queue()
         self._result_q = ctx.Queue()
         self._stop_event = ctx.Event()
-        self._skip_event = ctx.Event()
         self._pause_event = ctx.Event()
+        self._skip_events = [ctx.Event() for _ in range(self.workers)]
         for widx in range(self.workers):
             p = ctx.Process(target=_pool_worker,
                             args=(self._task_q, self._result_q,
-                                  self._stop_event, self._skip_event,
+                                  self._stop_event, self._skip_events[widx],
                                   self._pause_event, widx),
                             daemon=True)
             p.start()
@@ -751,10 +902,8 @@ class PoolRunner:
             self._pause_event.clear()
 
     def skip_current(self):
-        if self._outstanding:
-            self._skip_event.set()
-            self._skip_wait = True
-            self._skip_hold = True       # 暂停派发新任务，防止新组被级联跳过
+        """跳过当前正在计算的所有组（F10）。"""
+        self.skip_all()
 
     def stop(self):
         self._stop_flag = True
@@ -779,7 +928,7 @@ class PoolRunner:
     # ---------------- 内部 ----------------
 
     def _refill(self):
-        while not self._stop_flag and not self._paused and not self._skip_hold \
+        while not self._stop_flag and not self._paused \
                 and len(self._outstanding) < self.workers and not self._exhausted:
             if self._pending_item is None:
                 try:
@@ -789,7 +938,8 @@ class PoolRunner:
                     return
             _, k = self._pending_item
             seq = self._seq
-            self._task_q.put((seq, k, self.N, self.limit, self.mode, self.detail))
+            self._task_q.put((seq, k, self.N, self.limit, self.mode,
+                              self.detail, self.ppn, self.alg))
             self._outstanding[seq] = (k, f"数量级 10^{k}", time.perf_counter())
             self._seq += 1
             self._pending_item = None
@@ -819,10 +969,6 @@ class PoolRunner:
             self.out_q.put(("slot", seq, [(f"  数量级计算出错：{a}\n", "hard")]))
             self._done += 1
             self._stats["partial"] += 1
-        if self._skip_wait and not self._outstanding:
-            self._skip_event.clear()
-            self._skip_wait = False
-            self._skip_hold = False
 
     @staticmethod
     def _phase_of(text):
@@ -851,7 +997,7 @@ class PoolRunner:
                + (f" · 正在算：{infl}" if infl else "")
                + (" · 已暂停" if self._paused else "")
                + (" · 正在停止…" if self._stop_flag else "")
-               + (" · 已请求跳过当前…" if self._skip_wait else ""))
+)
         self.out_q.put(("status", txt))
         self.out_q.put(("outstanding", len(self._outstanding)))
 
@@ -869,30 +1015,35 @@ class PoolRunner:
     def _post_progress_line(self, now):
         """进行中的组汇总：一个数量级一行，含正在算的数、其耗时与所用进程。"""
         if self._paused:
-            lines = ["[已暂停] 正在计算的组已就地冻结（点「继续」恢复）"]
+            rows = [(None, "[已暂停] 正在计算的组已就地冻结（点「继续」恢复）")]
         elif not self._outstanding:
-            lines = ["[正在计算] 等待计算结果…"]
+            rows = [(None, "[正在计算] 等待计算结果…")]
         else:
-            header = (f"[正在计算] 共 {len(self._outstanding)} 组 · "
-                      f"并行 {self.workers} 进程（每组占 1 个）")
-            lines = [header]
+            busy = len(self._outstanding)
+            idle = max(0, self.workers - busy)
+            rows = [(None, f"[正在计算] 共 {busy} 组 · 进程 {self.workers} 个"
+                           f"（忙碌 {busy}，空闲 {idle}，每组占 1 个）")]
             for seq, (k, _pretty, t) in sorted(self._outstanding.items()):
-                if len(lines) > 12:
-                    lines.append(f"……其余 {len(self._outstanding) - 12} 组进行中")
+                if len(rows) > 12:
+                    rows.append((None, f"……其余 {len(self._outstanding) - 12} 组进行中"))
                     break
                 detail = self._prog_detail.get(seq)
                 status = self._short_status(detail[1] if detail else None)
                 widx = self._widx.get(seq)
-                wtxt = f" · 进程#{widx + 1}" if widx is not None else ""
+                wtxt = ""
+                if widx is not None:
+                    pid = self.pids[widx] if widx < len(self.pids) else None
+                    pct = self.cpu_by_pid.get(pid)
+                    wtxt = f" · 进程#{widx + 1}" + (f"（CPU {pct:.0f}%）" if pct else "")
                 cur = self._curnum.get(seq)
                 if cur:
-                    lines.append(f"数量级 10^{k}（本组已 {now - t:.0f} 秒）"
-                                 f"正在算 {cur[0]}（该数已 {now - cur[1]:.0f} 秒，"
-                                 f"{status}）{wtxt}")
+                    rows.append((seq, f"数量级 10^{k}（本组已 {now - t:.0f} 秒）"
+                                       f"正在算 {cur[0]}（该数已 {now - cur[1]:.0f} 秒，"
+                                       f"{status}）{wtxt}"))
                 else:
-                    lines.append(f"数量级 10^{k}（本组已 {now - t:.0f} 秒，"
-                                 f"{status}）{wtxt}")
-        self.out_q.put(("progress_lines", lines))
+                    rows.append((seq, f"数量级 10^{k}（本组已 {now - t:.0f} 秒，"
+                                      f"{status}）{wtxt}"))
+        self.out_q.put(("progress_rows", rows))
 
     def _feeder_loop(self):
         try:
@@ -1110,6 +1261,29 @@ TAGS = {
 }
 
 LIMIT_CHOICES = ["不限时", "5", "10", "30", "60", "300", "600", "1800", "3600"]
+ALG_CHOICES = [("自动（p-1 → rho）", "auto"), ("仅 Pollard rho", "rho"),
+               ("仅 p-1", "pm1"), ("ECM 椭圆曲线", "ecm"),
+               ("深度 p-1 → ECM → rho", "deep")]
+THEMES = {
+    "经典简洁": {
+        "panel": "#f0f0f0", "fg": "#1a1a1a", "btn_bg": "#e8e8e8", "btn_fg": "#1a1a1a",
+        "txt_bg": "#fcfcf8", "txt_fg": "#222222", "evt_bg": "#f3faf3", "evt_fg": "#333333",
+        "live": "#2e7d32", "group": "#1a5fa8", "prime": "#c0392b",
+        "hard": "#b9770e", "muted": "#8a8a8a", "dim": "#555555", "accent": "#1a5fa8",
+    },
+    "科幻炫酷": {
+        "panel": "#0b1220", "fg": "#c8e6ff", "btn_bg": "#142848", "btn_fg": "#00e5ff",
+        "txt_bg": "#0b1220", "txt_fg": "#c8e6ff", "evt_bg": "#0d1626", "evt_fg": "#9fd8ff",
+        "live": "#00ff9d", "group": "#00e5ff", "prime": "#ff3366",
+        "hard": "#ffb300", "muted": "#5f7fa6", "dim": "#5f7fa6", "accent": "#00e5ff",
+    },
+    "卡通二次元": {
+        "panel": "#fff3f8", "fg": "#6a4a6a", "btn_bg": "#ffd6e8", "btn_fg": "#a03a6b",
+        "txt_bg": "#fffafc", "txt_fg": "#5a4a6a", "evt_bg": "#fff0f7", "evt_fg": "#6a4a6a",
+        "live": "#ff6fa5", "group": "#ff7bac", "prime": "#e0338c",
+        "hard": "#f39c12", "muted": "#b0a0c0", "dim": "#a08aa8", "accent": "#ff7bac",
+    },
+}
 
 
 class App:
@@ -1120,6 +1294,7 @@ class App:
         self.running = False
         self.runner_pids = []
         self._closing = False
+        self.cpu_by_pid = {}          # pid -> 该进程 CPU%（监控线程写入，进度行读取）
         self._slots = {}
         self._next_seq = 0
         self._outstanding = 0
@@ -1143,12 +1318,15 @@ class App:
         ttk.Label(sysbar, textvariable=self.var_sys, foreground="#555",
                   wraplength=1150, justify="left").pack(fill="x")
 
-        # 实时进度行：独立于结果文本区，避免与正文穿插（原地去刷新，不刷屏）
+        # 实时进度行：独立于结果文本区，每个数量级一行，行尾带“跳过”按钮
         livebar = ttk.Frame(root, padding=(10, 0))
         livebar.pack(side="bottom", fill="x")
-        self.var_live = tk.StringVar(value="")
-        ttk.Label(livebar, textvariable=self.var_live, foreground="#2e7d32",
-                  font=("Consolas", 10), wraplength=1150, justify="left").pack(fill="x")
+        self.liveframe = tk.Frame(livebar, bg="#f0f0f0")
+        self.liveframe.pack(fill="x")
+        self._live_fg = "#2e7d32"
+        self._panel = "#f0f0f0"
+        self._btn_bg = "#e8e8e8"
+        self._btn_fg = "#1a1a1a"
 
         top = ttk.Frame(root, padding=(10, 10, 10, 2))
         top.pack(fill="x")
@@ -1169,6 +1347,10 @@ class App:
         self.var_workers = tk.IntVar(value=ncpu)
         ttk.Spinbox(top, from_=1, to=max(ncpu, 1), increment=1,
                     textvariable=self.var_workers, width=4).pack(side="left", padx=(2, 8))
+        ttk.Label(top, text="每组找质数:").pack(side="left")
+        self.var_ppn = tk.IntVar(value=PRIMES_PER_GROUP)
+        ttk.Spinbox(top, from_=1, to=20, increment=1,
+                    textvariable=self.var_ppn, width=3).pack(side="left", padx=(2, 8))
         self.btn_start = ttk.Button(top, text="开始分解", command=self.start)
         self.btn_start.pack(side="left")
         self.btn_pause = ttk.Button(top, text="暂停", command=self.toggle_pause,
@@ -1191,6 +1373,18 @@ class App:
         self.var_detail = tk.BooleanVar(value=False)
         ttk.Checkbutton(mid, text="列出合数明细（默认紧凑：只列质数+合数摘要）",
                         variable=self.var_detail).pack(side="left", padx=(14, 0))
+        ttk.Label(mid, text="找因子算法:").pack(side="left", padx=(14, 0))
+        self.var_alg = tk.StringVar(value=ALG_CHOICES[0][0])
+        self.cmb_alg = ttk.Combobox(mid, textvariable=self.var_alg, width=16,
+                                    values=[name for name, _v in ALG_CHOICES],
+                                    state="readonly")
+        self.cmb_alg.pack(side="left", padx=(2, 8))
+        ttk.Label(mid, text="界面风格:").pack(side="left")
+        self.var_theme = tk.StringVar(value=self._load_theme())
+        self.cmb_theme = ttk.Combobox(mid, textvariable=self.var_theme, width=10,
+                                      values=list(THEMES.keys()), state="readonly")
+        self.cmb_theme.pack(side="left", padx=(2, 0))
+        self.cmb_theme.bind("<<ComboboxSelected>>", lambda _e: self.apply_theme())
 
         hint = ("程序会为每个数量级（个位、十位、百位…共 N 的位数个）找出前 3 个质数：从 10^k 起"
                 "一个一个往上检查，途中遇到的合数也会按所选模式分解。默认只显示质数和合数总数，"
@@ -1236,6 +1430,7 @@ class App:
         for tag, kw in TAGS.items():
             self.txt.tag_configure(tag, **kw)
 
+        self.apply_theme()
         root.protocol("WM_DELETE_WINDOW", self._on_close)
         root.bind("<F9>", lambda _e: self.toggle_pause())
         root.bind("<F10>", lambda _e: self.skip_current())
@@ -1277,6 +1472,11 @@ class App:
         workers = max(1, min(workers, (os.cpu_count() or 1) * 2))
         mode = self.var_mode.get()
         detail = bool(self.var_detail.get())
+        try:
+            ppn = min(max(int(self.var_ppn.get()), 1), 20)
+        except Exception:
+            ppn = PRIMES_PER_GROUP
+        alg = dict(ALG_CHOICES).get(self.var_alg.get(), "auto")
         groups = len(str(N))
         if groups > 400 and not messagebox.askyesno(
                 "确认",
@@ -1295,9 +1495,9 @@ class App:
         self.evt.configure(state="disabled")
         mode_txt = "完整质因数分解" if mode == "full" else "只分解成两数相乘（证明是合数即可）"
         self._append(
-            f"目标：每个数量级 10^k 从 10^k 起逐个检查，找出前 {PRIMES_PER_GROUP} 个质数"
+            f"目标：每个数量级 10^k 从 10^k 起逐个检查，找出前 {ppn} 个质数"
             f"（途中合数也按模式分解，{'逐一列出' if detail else '折叠为组末摘要'}）\n"
-            f"本次设置：N = {pretty_num(N, 80)}（{len(str(N))} 位）｜{mode_txt}｜"
+            f"本次设置：N = {pretty_num(N, 80)}（{len(str(N))} 位）｜{mode_txt}｜找因子算法：{self.var_alg.get()}"
             f"{workers} 个进程｜每组限时 {'不限时' if limit is None else str(limit) + ' 秒'}\n"
             "怎么读结果：红色 = 质数；橙色 = 限时内没算完或已跳过；"
             "剩余大数「可能是质数，也可能是两个大质数的乘积」；\n"
@@ -1310,7 +1510,8 @@ class App:
         self.btn_skip["state"] = "disabled"
         self.pbar.start(50)
         self.var_status.set(f"正在启动 {workers} 个计算进程…")
-        self.runner = PoolRunner(N, limit, mode, workers, self.q, detail)
+        self.runner = PoolRunner(N, limit, mode, workers, self.q, detail, ppn, alg)
+        self.runner.cpu_by_pid = self.cpu_by_pid
         self.runner.start()
         self.runner_pids = self.runner.pids
 
@@ -1325,8 +1526,9 @@ class App:
             self.btn_pause["text"] = "暂停"
 
     def skip_current(self):
+        """跳过当前正在计算的所有组（F10）。"""
         if self.running and self.runner is not None:
-            self.runner.skip_current()
+            self.runner.skip_all()
 
     def stop(self):
         if self.running and self.runner is not None:
@@ -1344,6 +1546,67 @@ class App:
         self.btn_stop["state"] = "disabled"
         self.pbar.stop()
         self.var_status.set(status_text)
+
+    # ---------------- 主题 ----------------
+
+    def _settings_path(self):
+        base = sys.executable if getattr(sys, "frozen", False) else __file__
+        return os.path.join(os.path.dirname(os.path.abspath(base)), "分解工具设置.json")
+
+    def _load_theme(self):
+        try:
+            import json
+            with open(self._settings_path(), encoding="utf-8") as f:
+                name = json.load(f).get("theme", "经典简洁")
+            return name if name in THEMES else "经典简洁"
+        except Exception:
+            return "经典简洁"
+
+    def apply_theme(self, *_args):
+        """按所选风格（经典/科幻/二次元）给全部控件上色，并持久化选择。"""
+        name = self.var_theme.get()
+        th = THEMES.get(name, THEMES["经典简洁"])
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure(".", background=th["panel"], foreground=th["fg"],
+                        fieldbackground=th["txt_bg"])
+        style.configure("TFrame", background=th["panel"])
+        style.configure("TLabel", background=th["panel"], foreground=th["fg"])
+        style.configure("Dim.TLabel", background=th["panel"], foreground=th["dim"])
+        style.configure("TButton", background=th["btn_bg"], foreground=th["btn_fg"],
+                        padding=(8, 2))
+        style.map("TButton",
+                  background=[("disabled", th["panel"])],
+                  foreground=[("disabled", th["muted"])])
+        style.configure("TCheckbutton", background=th["panel"], foreground=th["fg"])
+        style.configure("TRadiobutton", background=th["panel"], foreground=th["fg"])
+        style.configure("TCombobox", fieldbackground=th["txt_bg"], foreground=th["fg"],
+                        background=th["btn_bg"])
+        style.configure("TSpinbox", fieldbackground=th["txt_bg"], foreground=th["fg"],
+                        background=th["panel"], arrowcolor=th["fg"])
+        style.configure("TProgressbar", troughcolor=th["txt_bg"], background=th["accent"])
+        self.root.configure(bg=th["panel"])
+        self.liveframe.configure(bg=th["panel"])
+        self._panel = th["panel"]
+        self._btn_bg = th["btn_bg"]
+        self._btn_fg = th["btn_fg"]
+        self._live_fg = th["live"]
+        self.txt.configure(bg=th["txt_bg"], fg=th["txt_fg"],
+                           insertbackground=th["txt_fg"])
+        self.evt.configure(bg=th["evt_bg"], fg=th["evt_fg"],
+                           insertbackground=th["evt_fg"])
+        for tag, key in (("group", "group"), ("prime", "prime"),
+                         ("hard", "hard"), ("muted", "muted")):
+            self.txt.tag_configure(tag, foreground=th[key])
+        try:
+            import json
+            with open(self._settings_path(), "w", encoding="utf-8") as f:
+                json.dump({"theme": name}, f)
+        except Exception:
+            pass
 
     def _on_close(self):
         self._closing = True
@@ -1381,6 +1644,28 @@ class App:
             self._next_seq += 1
         self.txt.see("end")
 
+    def _update_progress(self, rows):
+        """重建实时进度区：每个数量级一行，行尾带该组的“跳过”按钮。"""
+        for w in self.liveframe.winfo_children():
+            w.destroy()
+        for seq, text in rows:
+            row = tk.Frame(self.liveframe, bg=self._panel)
+            row.pack(fill="x")
+            tk.Label(row, text=text, anchor="w", justify="left",
+                     bg=self._panel, fg=self._live_fg,
+                     font=("Consolas", 10)).pack(side="left", fill="x", expand=True)
+            if seq is not None:
+                tk.Button(row, text="跳过", font=("Microsoft YaHei UI", 8),
+                          bg=self._btn_bg, fg=self._btn_fg, relief="flat",
+                          bd=0, padx=8, pady=1, cursor="hand2",
+                          command=lambda s=seq: self.skip_one(s)
+                          ).pack(side="right", padx=(6, 0))
+
+    def skip_one(self, seq):
+        """只跳过指定数量级。"""
+        if self.running and self.runner is not None:
+            self.runner.skip_one(seq)
+
     def _poll(self):
         try:
             while True:
@@ -1390,8 +1675,8 @@ class App:
                     self._feed_slot(msg[1], msg[2])
                 elif kind == "milestone":
                     self._evt_append(msg[1])
-                elif kind == "progress_lines":
-                    self.var_live.set("\n".join(msg[1]))
+                elif kind == "progress_rows":
+                    self._update_progress(msg[1])
                 elif kind == "status":
                     self.var_status.set(msg[1])
                 elif kind == "outstanding":
@@ -1436,7 +1721,9 @@ class App:
                         continue
                     alive += 1
                     cur_pid[pid] = t
-                    cpu_dt += max(0.0, t - prev_pid.get(pid, t))
+                    d = max(0.0, t - prev_pid.get(pid, t))
+                    cpu_dt += d
+                    self.cpu_by_pid[pid] = d / 2.0 * 100.0   # 单核百分比
                     w = _proc_workingset(pid)
                     if w:
                         mem += w
@@ -1450,6 +1737,8 @@ class App:
                         sys_txt = f"整机 CPU {max(0.0, 1 - d_idle / d_total) * 100:.0f}%"
                 prev_sys = cur_sys
                 cores = cpu_dt / 2.0
+                busy = self.runner.busy_count() if self.runner is not None else 0
+                busy_txt = f"（忙碌 {busy} · 空闲 {max(0, alive - 1 - busy)}）" if alive > 1 else ""
                 ram = _ram_info()
                 if ram:
                     load, total, avail = ram
@@ -1457,7 +1746,7 @@ class App:
                 else:
                     ram_txt = "内存信息不可用"
                 text = (f"电脑：{get_cpu_name()}｜{ncpu} 线程｜{sys_txt}｜{ram_txt}\n"
-                        f"本程序：{alive} 个进程 · CPU ≈{cores:.1f} 核"
+                        f"本程序：{alive} 个进程{busy_txt} · CPU ≈{cores:.1f} 核"
                         f"（{cores / ncpu * 100:.0f}%）· 占用内存 {_fmt_bytes(mem)}")
                 self.q.put(("sysinfo", text))
             except Exception:
@@ -1509,6 +1798,15 @@ def selftest():
     d, cof = factorize_two(91, ctl)
     assert d * cof == 91 and {d, cof} == {7, 13}
     assert factorize_two(2 ** 61 - 1, ctl) is None
+    # ECM 椭圆曲线分解
+    random.seed(11)
+    q1 = _next_prime(random.randrange(10 ** 5, 10 ** 6))
+    q2 = _next_prime(random.randrange(10 ** 12, 10 ** 13))
+    n_ecm = q1 * q2
+    d = pollard_ecm(n_ecm, Ctl(stop_event=threading.Event(),
+                               deadline=time.perf_counter() + 60))
+    assert d in (q1, q2), (d, q1, q2)
+    print(f"ECM OK：{d} 是 {n_ecm} 的因子")
     # 数量级扫描：找前 3 个质数
     rows, pf, scanned, stop = scan_magnitude(0, 10, "full", None)
     primes0 = [num for num, kind, *_ in rows if kind == "prime"]
@@ -1519,7 +1817,14 @@ def selftest():
     rows, pf, scanned, stop = scan_magnitude(2, 10 ** 3, "two", None)
     primes2 = [num for num, kind, *_ in rows if kind == "prime"]
     assert primes2 == [101, 103, 107] and stop is None, (primes2, scanned)
-    print("数量级扫描 OK：10^0→[2,3,5]  10^1→[11,13,17]  10^2→[101,103,107]")
+    # 每组质数个数可配置
+    rows_p2, pf_p2, scanned_p2, stop_p2 = scan_magnitude(1, 10 ** 2, "full", None, False, 2)
+    primes_p2 = [num for num, kind, *_ in rows_p2 if kind == "prime"]
+    assert primes_p2 == [11, 13] and scanned_p2 == 4 and stop_p2 is None, (primes_p2, scanned_p2)
+    header, lines, tail = render_group_lines(1, 10 ** 2, rows_p2, pf_p2,
+                                             scanned_p2, None, False, 2)
+    assert "找到前 2 个质数" in tail[0]
+    print("数量级扫描 OK：10^0→[2,3,5]  10^1→[11,13,17]  10^2→[101,103,107]  每组质数个数可配")
     # 渲染：紧凑模式只列质数+合数摘要+耗时最长 3 个数；明细模式逐个列出
     header, lines, tail = render_group_lines(2, 10 ** 3, rows, 3, scanned, None, False)
     tags = [t for _l, t in lines]
@@ -1547,7 +1852,8 @@ def selftest():
         raise AssertionError("60 位半素数应在限时内超时")
     except FactorTimeout as e:
         facs, rem = e.args
-        assert not facs and rem == [semi], (facs, rem)
+        plain = [r[0] if isinstance(r, tuple) else r for r in rem]
+        assert not facs and plain == [semi], (facs, rem)
     print("限时超时路径 OK")
     # 跳过路径
     sk = threading.Event()
@@ -1624,12 +1930,12 @@ def selftest_skip_in_pool(semi):
     p = ctx.Process(target=_pool_worker,
                     args=(task_q, result_q, stop_ev, skip_ev, pause_ev, 0))
     p.start()
-    task_q.put((0, 1, 10 ** 40, None, "full", False))   # k=1 组：从 10 扫起，17 处找满 3 个质数（很快完成）
+    task_q.put((0, 1, 10 ** 40, None, "full", False, 3, "auto"))   # k=1 组：很快找满 3 个质数
     msg = _wait_group_result(result_q, 60)
     assert msg[3] == "group", msg
     # 不限时的大数量级组：k=500（1663 位），找 3 个质数平均要扫描上千个数、
     # 每个数试除上万次，短时间内不可能完成 → 只能靠跳过打断
-    task_q.put((1, 500, 10 ** 501, None, "full", False))
+    task_q.put((1, 500, 10 ** 501, None, "full", False, 3, "auto"))
     time.sleep(5.0)
     skip_ev.set()
     msg = _wait_group_result(result_q, 120)
