@@ -1294,6 +1294,7 @@ class App:
         self.running = False
         self.runner_pids = []
         self._closing = False
+        self._settings = self._load_settings()
         self.cpu_by_pid = {}          # pid -> 该进程 CPU%（监控线程写入，进度行读取）
         self._slots = {}
         self._next_seq = 0
@@ -1380,7 +1381,7 @@ class App:
                                     state="readonly")
         self.cmb_alg.pack(side="left", padx=(2, 8))
         ttk.Label(mid, text="界面风格:").pack(side="left")
-        self.var_theme = tk.StringVar(value=self._load_theme())
+        self.var_theme = tk.StringVar(value=self._settings.get("theme", "经典简洁"))
         self.cmb_theme = ttk.Combobox(mid, textvariable=self.var_theme, width=10,
                                       values=list(THEMES.keys()), state="readonly")
         self.cmb_theme.pack(side="left", padx=(2, 0))
@@ -1400,23 +1401,26 @@ class App:
 
         body = ttk.Frame(root)
         body.pack(fill="both", expand=True, padx=10, pady=6)
+        self._pw = ttk.Panedwindow(body, orient="horizontal")
+        self._pw.pack(fill="both", expand=True)
 
-        # 右侧：质数发现事件面板（累积显示，不与结果混排）
-        evtframe = ttk.Frame(body)
-        evtframe.pack(side="right", fill="y", padx=(8, 0))
+        # 右侧：质数发现事件面板（不换行 + 横向滚动；中间分隔条可拖动调宽）
+        evtframe = ttk.Frame(self._pw)
         ttk.Label(evtframe, text="找到质数记录（实时累积）", foreground="#2e7d32",
                   font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
         evt_vsb = ttk.Scrollbar(evtframe, orient="vertical")
-        self.evt = tk.Text(evtframe, width=46, font=("Consolas", 9), wrap="word",
+        evt_hsb = ttk.Scrollbar(evtframe, orient="horizontal")
+        self.evt = tk.Text(evtframe, width=72, font=("Consolas", 9), wrap="none",
                            state="disabled", bg="#f3faf3",
-                           yscrollcommand=evt_vsb.set)
+                           yscrollcommand=evt_vsb.set, xscrollcommand=evt_hsb.set)
         evt_vsb.configure(command=self.evt.yview)
+        evt_hsb.configure(command=self.evt.xview)
+        evt_hsb.pack(side="bottom", fill="x")
         evt_vsb.pack(side="right", fill="y")
         self.evt.pack(fill="both", expand=True)
 
         # 左侧：结果区
-        txtframe = ttk.Frame(body)
-        txtframe.pack(side="left", fill="both", expand=True)
+        txtframe = ttk.Frame(self._pw)
         hsb = ttk.Scrollbar(txtframe, orient="horizontal")
         vsb = ttk.Scrollbar(txtframe, orient="vertical")
         self.txt = tk.Text(txtframe, font=("Consolas", 10), wrap="none",
@@ -1424,6 +1428,11 @@ class App:
                            xscrollcommand=hsb.set, yscrollcommand=vsb.set)
         hsb.configure(command=self.txt.xview)
         vsb.configure(command=self.txt.yview)
+        self._pw.add(txtframe, weight=4)
+        self._pw.add(evtframe, weight=1)
+        sash = self._settings.get("sash")
+        if isinstance(sash, int) and sash >= 200:
+            root.after(200, lambda: self._pw.sash_pos(0, sash))
         hsb.pack(side="bottom", fill="x")
         vsb.pack(side="right", fill="y")
         self.txt.pack(fill="both", expand=True)
@@ -1549,6 +1558,29 @@ class App:
 
     # ---------------- 主题 ----------------
 
+    def _load_settings(self):
+        try:
+            import json
+            with open(self._settings_path(), encoding="utf-8") as f:
+                d = json.load(f)
+            return d if isinstance(d, dict) else {}
+        except Exception:
+            return {}
+
+    def _save_settings(self):
+        try:
+            import json
+            d = dict(self._settings) if isinstance(self._settings, dict) else {}
+            d["theme"] = self.var_theme.get()
+            try:
+                d["sash"] = int(self._pw.sash_pos(0))
+            except Exception:
+                pass
+            with open(self._settings_path(), "w", encoding="utf-8") as f:
+                json.dump(d, f)
+        except Exception:
+            pass
+
     def _settings_path(self):
         base = sys.executable if getattr(sys, "frozen", False) else __file__
         return os.path.join(os.path.dirname(os.path.abspath(base)), "分解工具设置.json")
@@ -1601,15 +1633,11 @@ class App:
         for tag, key in (("group", "group"), ("prime", "prime"),
                          ("hard", "hard"), ("muted", "muted")):
             self.txt.tag_configure(tag, foreground=th[key])
-        try:
-            import json
-            with open(self._settings_path(), "w", encoding="utf-8") as f:
-                json.dump({"theme": name}, f)
-        except Exception:
-            pass
+        self._save_settings()
 
     def _on_close(self):
         self._closing = True
+        self._save_settings()
         try:
             if self.runner is not None:
                 self.runner.close()
